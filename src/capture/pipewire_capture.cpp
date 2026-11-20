@@ -337,7 +337,7 @@ void PipeWireCapture::handleParamChanged(uint32_t id, const struct spa_pod* para
         return;
     }
 
-    hasExplicitModifier_ = (info.flags & SPA_VIDEO_FLAG_MODIFIER) != 0;
+    hasExplicitModifier_ = (modProp != nullptr) && ((modProp->flags & SPA_POD_PROP_FLAG_DONT_FIXATE) == 0);
     negotiatedModifier_ = hasExplicitModifier_ ? info.modifier : 0;
 
     // Never accept a non-linear modifier when operating in cross-GPU or SHM-only mode;
