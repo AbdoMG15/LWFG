@@ -1,7 +1,11 @@
 #include "lfg/capture/pipewire_capture.hpp"
 
 #include <spa/param/param.h>
+#if defined(__has_include)
+#if __has_include(<spa/param/video/raw-utils.h>)
 #include <spa/param/video/raw-utils.h>
+#endif
+#endif
 #include <spa/pod/builder.h>
 #include <spa/pod/iter.h>
 #include <spa/utils/defs.h>
