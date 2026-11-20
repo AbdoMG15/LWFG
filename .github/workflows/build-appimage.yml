@@ -1,0 +1,155 @@
+name: Build Linux AppImage
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+jobs:
+  build-appimage:
+    runs-on: ubuntu-24.04
+    container:
+      image: ubuntu:22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            pkg-config \
+            ca-certificates \
+            curl \
+            file \
+            desktop-file-utils \
+            libvulkan-dev \
+            libpipewire-0.3-dev \
+            libportal-dev \
+            libglib2.0-dev \
+            libxcb1-dev \
+            libxcb-shape0-dev \
+            libxcb-randr0-dev \
+            libdrm-dev
+
+      - name: Build LWFG and stage AppDir
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build build -j"$(nproc)"
+          DESTDIR="$PWD/AppDir" cmake --install build
+          ln -sf lfg "$PWD/AppDir/usr/bin/lwfg"
+
+      - name: Create desktop entry and install icons
+        run: |
+          install -d AppDir/usr/share/applications
+          cat > AppDir/usr/share/applications/lfg-linux.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=LWFG
+          GenericName=Linux Windowed Frame Generation
+          Comment=LWFG (Linux Windowed Frame Generation) — Lossless Scaling LSFG 3.1 Overlay for Linux
+          Exec=lfg
+          Icon=lfg-linux
+          StartupWMClass=lfg-linux
+          Terminal=false
+          Categories=Game;Utility;
+          EOF
+          desktop-file-validate AppDir/usr/share/applications/lfg-linux.desktop
+          install -Dm644 assets/lfg-linux-32.png AppDir/usr/share/icons/hicolor/32x32/apps/lfg-linux.png
+
+      - name: Populate AppDir dependencies with linuxdeploy
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          curl -fsSL -o linuxdeploy-x86_64.AppImage \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          curl -fsSL -o appimagetool-x86_64.AppImage \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage appimagetool-x86_64.AppImage
+          ./linuxdeploy-x86_64.AppImage \
+            --appdir AppDir \
+            --executable AppDir/usr/bin/lfg \
+            --desktop-file AppDir/usr/share/applications/lfg-linux.desktop \
+            --icon-file assets/lfg-linux.png
+
+      - name: Prune host-coupled libraries from AppDir
+        run: |
+          if [ -d AppDir/usr/lib ]; then
+            find AppDir/usr/lib -maxdepth 2 \( \
+              -name 'libvulkan*' -o \
+              -name 'libpipewire*' -o \
+              -name 'libspa*' -o \
+              -name 'libdrm*' -o \
+              -name 'libGL*' -o \
+              -name 'libEGL*' -o \
+              -name 'libgbm*' -o \
+              -name 'libwayland*' -o \
+              -name 'libglib-2.0*' -o \
+              -name 'libgio-2.0*' -o \
+              -name 'libgobject-2.0*' -o \
+              -name 'libgmodule-2.0*' -o \
+              -name 'libgthread-2.0*' -o \
+              -name 'libdbus*' -o \
+              -name 'libsystemd*' -o \
+              -name 'libmount*' -o \
+              -name 'libblkid*' -o \
+              -name 'libselinux*' -o \
+              -name 'libpcre*' -o \
+              -name 'libffi*' -o \
+              -name 'libz.so*' -o \
+              -name 'libstdc++*' -o \
+              -name 'libgcc_s*' \
+            \) -delete
+          fi
+          ls -la AppDir/usr/lib || true
+          ldd AppDir/usr/bin/lfg
+
+      - name: Build and smoke-test AppImage
+        env:
+          ARCH: x86_64
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "release" ] && [ -n "${GITHUB_REF_NAME}" ]; then
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION="0.1.5"
+          fi
+          OUT_NAME="LWFG-${VERSION}-x86_64.AppImage"
+          ./appimagetool-x86_64.AppImage --no-appstream AppDir "$OUT_NAME"
+          sha256sum "$OUT_NAME" > "${OUT_NAME}.sha256"
+          ./"$OUT_NAME" --appimage-extract-and-run --help
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lwfg-appimage
+          path: |
+            LWFG-*.AppImage
+            LWFG-*.AppImage.sha256
+
+  publish-release:
+    needs: build-appimage
+    if: github.event_name == 'release'
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download AppImage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: lwfg-appimage
+          path: dist
+
+      - name: Attach AppImage to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
