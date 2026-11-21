@@ -9,7 +9,6 @@
 > - If LWFG does not automatically detect `Lossless.dll` from your Steam library on startup, open the **Settings** tab inside the app and **locate `Lossless.dll` (or its folder) manually** — frame generation will not work until `Lossless.dll` is loaded.
 
 
----
 
 ## Installation
 
@@ -46,7 +45,6 @@ cmake --build build -j"$(nproc)"
 sudo cmake --install build
 ```
 
----
 
 ## How to Use
 
@@ -64,7 +62,6 @@ sudo cmake --install build
    - Pick the game window, video player, or screen in the system capture prompt.
    - Press **`Alt+F9`** (or click **STOP**) anytime to pause or stop.
 
----
 
 ## How It Works
 1. **Captures your window or screen:** Uses `xdg-desktop-portal` and PipeWire to grab each new frame on the GPU.
