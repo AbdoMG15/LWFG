@@ -1,0 +1,20 @@
+[Desktop Entry]
+Type=Application
+Name=LWFG
+GenericName=Linux Windowed Frame Generation
+Comment=LWFG (Linux Windowed Frame Generation) — Lossless Scaling LSFG 3.1 Overlay for Linux
+Exec=lfg
+Icon=lfg-linux
+StartupWMClass=lfg-linux
+Terminal=false
+Categories=Game;Utility;
+Keywords=lwfg;lfg;frame;generation;lossless;scaling;vulkan;fps;adaptive;lsfg;
+Actions=ToggleFG;QuitFG;
+
+[Desktop Action ToggleFG]
+Name=Start / Stop Frame Generation
+Exec=lfg --toggle
+
+[Desktop Action QuitFG]
+Name=Quit LWFG
+Exec=lfg --quit

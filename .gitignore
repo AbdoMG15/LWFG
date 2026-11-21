@@ -20,8 +20,12 @@ compile_commands.json
 *~
 .DS_Store
 
-# AppImage build artifacts
+# AppImage and package build artifacts
 AppDir/
+dist/
 *.AppImage
 *.AppImage.sha256
+*.deb
+*.rpm
+SHA256SUMS.txt
 
