@@ -1,4 +1,3 @@
-# LWFG
 # <img src="assets/lfg-linux.png" width="38" align="top" /> LWFG (Linux Windowed Frame Generation)
 
 **LWFG** is an **unofficial**, independent Linux windowed frame generation overlay powered by **Lossless Scaling Frame Generation (LSFG 3.1)** over PipeWire, `xdg-desktop-portal`, and Vulkan.
