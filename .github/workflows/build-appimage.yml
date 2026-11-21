@@ -159,7 +159,7 @@ jobs:
           }
 
           integrate_desktop() {
-              [ -n "${APPIMAGE:-}" ] && [ -f "$APPIMAGE" ] && [ -n "${HOME:-}" ] && [ -w "$HOME" ] || return 0
+              [ -n "${APPIMAGE:-}" ] && [ -f "$APPIMAGE" ] && [ -n "${HOME:-}" ] || return 1
               if [ -f "$DESKTOP_FILE" ] && grep -Fqx "TryExec=$APPIMAGE" "$DESKTOP_FILE" 2>/dev/null; then
                   return 0
               fi
@@ -167,7 +167,7 @@ jobs:
               mkdir -p "$APP_DIR" \
                   "$(dirname -- "$ICON_128")" \
                   "$(dirname -- "$ICON_32")" \
-                  "$(dirname -- "$PIXMAP")" 2>/dev/null || return 0
+                  "$(dirname -- "$PIXMAP")" 2>/dev/null || return 1
 
               if [ -f "$HERE/usr/share/icons/hicolor/128x128/apps/lfg-linux.png" ]; then
                   cp -f "$HERE/usr/share/icons/hicolor/128x128/apps/lfg-linux.png" "$ICON_128" 2>/dev/null || true
@@ -178,7 +178,7 @@ jobs:
               fi
 
               EXEC_PATH="$(printf '%s\n' "$APPIMAGE" | sed 's/\\/\\\\/g; s/"/\\"/g; s/`/\\`/g; s/\$/\\$/g')"
-              cat > "$DESKTOP_FILE" <<DESKTOP_EOF || return 0
+              cat > "$DESKTOP_FILE" <<DESKTOP_EOF || return 1
           [Desktop Entry]
           Type=Application
           Name=LWFG
@@ -189,7 +189,7 @@ jobs:
           Icon=$ICON_128
           StartupWMClass=lfg-linux
           Terminal=false
-          Categories=Game;Utility;
+          Categories=Game;
           Keywords=lwfg;lfg;frame;generation;lossless;scaling;vulkan;fps;adaptive;lsfg;
           Actions=ToggleFG;QuitFG;
 
@@ -212,7 +212,7 @@ jobs:
 
           case "${1:-}" in
               --install-desktop)
-                  integrate_desktop
+                  integrate_desktop || { echo "Error: Failed to install desktop integration (APPIMAGE=${APPIMAGE:-unset}, HOME=${HOME:-unset})." >&2; exit 1; }
                   wait
                   exit 0
                   ;;
@@ -225,7 +225,7 @@ jobs:
           if [ "${LWFG_NO_INTEGRATE:-0}" != "1" ]; then
               case "${1:-}" in
                   --help|-h|--stop|--quit|--toggle) ;;
-                  *) integrate_desktop ;;
+                  *) integrate_desktop || true ;;
               esac
           fi
 
@@ -244,6 +244,7 @@ jobs:
 
           ./dist/LWFG-x86_64.AppImage --appimage-extract-and-run --help
 
+          mkdir -p /tmp/test-appimage /tmp/test-installer
           HOME=/tmp/test-appimage ./dist/LWFG-x86_64.AppImage --appimage-extract-and-run --install-desktop
           desktop-file-validate /tmp/test-appimage/.local/share/applications/lfg-linux.desktop
           test -f /tmp/test-appimage/.local/share/icons/hicolor/128x128/apps/lfg-linux.png

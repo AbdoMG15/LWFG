@@ -108,7 +108,7 @@ Exec="$EXEC_BIN"
 Icon=$ICON_128
 StartupWMClass=lfg-linux
 Terminal=false
-Categories=Game;Utility;
+Categories=Game;
 Keywords=lwfg;lfg;frame;generation;lossless;scaling;vulkan;fps;adaptive;lsfg;
 Actions=ToggleFG;QuitFG;
 
