@@ -9,6 +9,9 @@
 > - If LWFG does not automatically detect `Lossless.dll` from your Steam library on startup, open the **Settings** tab inside the app and **locate `Lossless.dll` (or its folder) manually** — frame generation will not work until `Lossless.dll` is loaded.
 
 
+If you enjoyed LWFG and want to buy me a shawarma(:
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/abdomg)
+---
 
 ## Installation
 
