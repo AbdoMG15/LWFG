@@ -71,6 +71,7 @@ public:
     void endOneShotCommands(VkCommandPool pool, VkQueue queue, VkCommandBuffer cmd) const;
     void submitOneShotAsync(VkQueue queue, VkCommandBuffer cmd) const;
     void waitOneShotAsync() const;
+    bool pollOneShotAsyncComplete() const;
     bool isOneShotAsyncPending() const { return oneShotInUse_; }
 
 private:

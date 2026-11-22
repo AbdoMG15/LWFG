@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -20,6 +21,9 @@
 namespace lfg {
 
 FrameGenerator::FrameGenerator(const Options& options) : options_(options) {
+    if (const char* d = std::getenv("LFG_DEDUP"); d && std::strcmp(d, "0") == 0) {
+        dedupEnabled_ = false;
+    }
     options_.multiplier = std::clamp(options_.multiplier, 2, kMaxMultiplier);
     options_.flowScale = std::clamp(options_.flowScale, 25, 100);
     if (options_.targetFps <= 0) {
@@ -98,9 +102,12 @@ void FrameGenerator::teardownVulkanBackend() {
     if (vk_) {
         vk_->waitOneShotAsync();
         vkDeviceWaitIdle(vk_->device());
+        clearPrefetchedFrame();
+        resetPacerState(false);
         overlay_.reset();
         lsfg_.reset();
         importer_.reset();
+        destroyThumbResources();
         destroyStagingBuffer();
         destroySlots();
         vk_.reset();
@@ -229,6 +236,307 @@ void FrameGenerator::destroyStagingBuffer() {
     stagingSize_ = 0;
 }
 
+void FrameGenerator::ensureThumbResources() {
+    if (thumbImage_ != VK_NULL_HANDLE && thumbMapped_ != nullptr) {
+        return;
+    }
+    destroyThumbResources();
+
+    try {
+        VkImageCreateInfo imgInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        imgInfo.imageType = VK_IMAGE_TYPE_2D;
+        imgInfo.format = VK_FORMAT_B8G8R8A8_UNORM;
+        imgInfo.extent = {kThumbW, kThumbH, 1};
+        imgInfo.mipLevels = 1;
+        imgInfo.arrayLayers = 1;
+        imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imgInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        imgInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VK_CHECK(vkCreateImage(vk_->device(), &imgInfo, nullptr, &thumbImage_));
+
+        VkMemoryRequirements imgReqs;
+        vkGetImageMemoryRequirements(vk_->device(), thumbImage_, &imgReqs);
+        thumbImageMemory_ = vk_->allocateMemory(imgReqs, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VK_CHECK(vkBindImageMemory(vk_->device(), thumbImage_, thumbImageMemory_, 0));
+
+        VkBufferCreateInfo bufInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bufInfo.size = kThumbBytes;
+        bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        VK_CHECK(vkCreateBuffer(vk_->device(), &bufInfo, nullptr, &thumbBuffer_));
+
+        VkMemoryRequirements bufReqs;
+        vkGetBufferMemoryRequirements(vk_->device(), thumbBuffer_, &bufReqs);
+
+        VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        alloc.allocationSize = bufReqs.size;
+        alloc.memoryTypeIndex = vk_->findMemoryType(
+            bufReqs.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        VK_CHECK(vkAllocateMemory(vk_->device(), &alloc, nullptr, &thumbBufferMemory_));
+        VK_CHECK(vkBindBufferMemory(vk_->device(), thumbBuffer_, thumbBufferMemory_, 0));
+
+        void* mapped = nullptr;
+        VK_CHECK(vkMapMemory(vk_->device(), thumbBufferMemory_, 0, kThumbBytes, 0, &mapped));
+        thumbMapped_ = static_cast<uint8_t*>(mapped);
+    } catch (...) {
+        destroyThumbResources();
+        throw;
+    }
+}
+
+void FrameGenerator::destroyThumbResources() {
+    hasLastUniqueThumb_ = false;
+    if (!vk_ || vk_->device() == VK_NULL_HANDLE) return;
+    if (thumbBufferMemory_ != VK_NULL_HANDLE) {
+        if (thumbMapped_) {
+            vkUnmapMemory(vk_->device(), thumbBufferMemory_);
+            thumbMapped_ = nullptr;
+        }
+        vkFreeMemory(vk_->device(), thumbBufferMemory_, nullptr);
+        thumbBufferMemory_ = VK_NULL_HANDLE;
+    }
+    if (thumbBuffer_ != VK_NULL_HANDLE) {
+        vkDestroyBuffer(vk_->device(), thumbBuffer_, nullptr);
+        thumbBuffer_ = VK_NULL_HANDLE;
+    }
+    if (thumbImage_ != VK_NULL_HANDLE) {
+        vkDestroyImage(vk_->device(), thumbImage_, nullptr);
+        thumbImage_ = VK_NULL_HANDLE;
+    }
+    if (thumbImageMemory_ != VK_NULL_HANDLE) {
+        vkFreeMemory(vk_->device(), thumbImageMemory_, nullptr);
+        thumbImageMemory_ = VK_NULL_HANDLE;
+    }
+}
+
+void FrameGenerator::recordThumbDownsample(VkCommandBuffer cmd, VkImage srcImage,
+                                           uint32_t srcW, uint32_t srcH) {
+    if (!dedupEnabled_ || thumbImage_ == VK_NULL_HANDLE || thumbBuffer_ == VK_NULL_HANDLE ||
+        srcW == 0 || srcH == 0) {
+        VkImageMemoryBarrier2 toGeneral{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        toGeneral.srcStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
+        toGeneral.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        toGeneral.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        toGeneral.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+        toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toGeneral.image = srcImage;
+        toGeneral.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        dep.imageMemoryBarrierCount = 1;
+        dep.pImageMemoryBarriers = &toGeneral;
+        vkCmdPipelineBarrier2(cmd, &dep);
+        return;
+    }
+
+    VkImageMemoryBarrier2 preThumb[2]{};
+    preThumb[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    preThumb[0].srcStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
+    preThumb[0].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    preThumb[0].dstStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
+    preThumb[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    preThumb[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    preThumb[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    preThumb[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    preThumb[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    preThumb[0].image = srcImage;
+    preThumb[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+    preThumb[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    preThumb[1].srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    preThumb[1].srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    preThumb[1].dstStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
+    preThumb[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    preThumb[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    preThumb[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    preThumb[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    preThumb[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    preThumb[1].image = thumbImage_;
+    preThumb[1].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+    VkDependencyInfo depPre{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    depPre.imageMemoryBarrierCount = 2;
+    depPre.pImageMemoryBarriers = preThumb;
+    vkCmdPipelineBarrier2(cmd, &depPre);
+
+    VkImageBlit thumbBlit{};
+    thumbBlit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    thumbBlit.srcOffsets[0] = {0, 0, 0};
+    thumbBlit.srcOffsets[1] = {static_cast<int32_t>(srcW), static_cast<int32_t>(srcH), 1};
+    thumbBlit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    thumbBlit.dstOffsets[0] = {0, 0, 0};
+    thumbBlit.dstOffsets[1] = {static_cast<int32_t>(kThumbW), static_cast<int32_t>(kThumbH), 1};
+    vkCmdBlitImage(cmd, srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, thumbImage_,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &thumbBlit, VK_FILTER_LINEAR);
+
+    VkImageMemoryBarrier2 postBlit[2]{};
+    postBlit[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    postBlit[0].srcStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
+    postBlit[0].srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    postBlit[0].dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    postBlit[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    postBlit[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    postBlit[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    postBlit[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    postBlit[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    postBlit[0].image = srcImage;
+    postBlit[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+    postBlit[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    postBlit[1].srcStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
+    postBlit[1].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    postBlit[1].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    postBlit[1].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    postBlit[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    postBlit[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    postBlit[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    postBlit[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    postBlit[1].image = thumbImage_;
+    postBlit[1].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+    VkDependencyInfo depPostBlit{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    depPostBlit.imageMemoryBarrierCount = 2;
+    depPostBlit.pImageMemoryBarriers = postBlit;
+    vkCmdPipelineBarrier2(cmd, &depPostBlit);
+
+    VkBufferImageCopy region{};
+    region.bufferOffset = 0;
+    region.bufferRowLength = kThumbW;
+    region.bufferImageHeight = kThumbH;
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageOffset = {0, 0, 0};
+    region.imageExtent = {kThumbW, kThumbH, 1};
+    vkCmdCopyImageToBuffer(cmd, thumbImage_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           thumbBuffer_, 1, &region);
+
+    VkMemoryBarrier2 hostVisible{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    hostVisible.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    hostVisible.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    hostVisible.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+    hostVisible.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+    VkDependencyInfo depHost{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    depHost.memoryBarrierCount = 1;
+    depHost.pMemoryBarriers = &hostVisible;
+    vkCmdPipelineBarrier2(cmd, &depHost);
+}
+
+void FrameGenerator::commitCurrentThumb() {
+    if (!thumbMapped_) return;
+    std::memcpy(lastUniqueThumb_.data(), thumbMapped_, static_cast<size_t>(kThumbBytes));
+    hasLastUniqueThumb_ = true;
+}
+
+bool FrameGenerator::isCurrentThumbDuplicate() const {
+    if (!dedupEnabled_ || !hasLastUniqueThumb_ || !thumbMapped_) {
+        return false;
+    }
+
+    uint64_t interiorSum = 0;
+    uint32_t interiorChanged = 0;
+    int interiorMax = 0;
+    uint32_t borderStrongChanged = 0;
+    int fullMax = 0;
+
+    for (uint32_t y = 0; y < kThumbH; ++y) {
+        const bool inInteriorY = (y >= 2 && y < 32);
+        for (uint32_t x = 0; x < kThumbW; ++x) {
+            const size_t idx = (static_cast<size_t>(y) * kThumbW + x) * 4u;
+            const int d0 = std::abs(static_cast<int>(thumbMapped_[idx + 0]) -
+                                    static_cast<int>(lastUniqueThumb_[idx + 0]));
+            const int d1 = std::abs(static_cast<int>(thumbMapped_[idx + 1]) -
+                                    static_cast<int>(lastUniqueThumb_[idx + 1]));
+            const int d2 = std::abs(static_cast<int>(thumbMapped_[idx + 2]) -
+                                    static_cast<int>(lastUniqueThumb_[idx + 2]));
+            const int d = std::max({d0, d1, d2});
+            fullMax = std::max(fullMax, d);
+
+            if (inInteriorY && x >= 2 && x < 62) {
+                interiorSum += static_cast<uint64_t>(d);
+                interiorMax = std::max(interiorMax, d);
+                if (d >= 2) ++interiorChanged;
+            } else {
+                if (d >= 4) ++borderStrongChanged;
+            }
+        }
+    }
+
+    const double interiorMad = static_cast<double>(interiorSum) / 1800.0;
+    return (interiorMad < 0.15 && interiorChanged <= 2 && interiorMax < 6) &&
+           (borderStrongChanged <= 4 && fullMax < 18);
+}
+
+void FrameGenerator::recordUniqueFrameTiming(std::chrono::steady_clock::time_point arrivalTime,
+                                             double fallbackPeriodMs, double fallbackJitterMs,
+                                             double& outPeriodMs, double& outJitterMs) {
+    if (hasLastUniqueArrival_) {
+        const double deltaMs =
+            std::chrono::duration<double, std::milli>(arrivalTime - lastUniqueArrival_).count();
+        if (deltaMs >= 2.5 && deltaMs <= 160.0) {
+            if (hasSmoothedUniquePeriod_ &&
+                std::abs(deltaMs - smoothedUniquePeriodMs_) > smoothedUniquePeriodMs_ * 0.25) {
+                if (++uniqueRegimeShiftCount_ >= 4) {
+                    uniqueDeltaCount_ = 0;
+                    uniqueDeltaHead_ = 0;
+                    uniqueRegimeShiftCount_ = 0;
+                }
+            } else {
+                uniqueRegimeShiftCount_ = 0;
+            }
+
+            uniqueDeltas_[uniqueDeltaHead_] = deltaMs;
+            uniqueDeltaHead_ = (uniqueDeltaHead_ + 1) % uniqueDeltas_.size();
+            if (uniqueDeltaCount_ < uniqueDeltas_.size()) ++uniqueDeltaCount_;
+
+            std::array<double, 16> sorted{};
+            const size_t n = std::min(uniqueDeltaCount_, sorted.size());
+            for (size_t i = 0; i < n; ++i) sorted[i] = uniqueDeltas_[i];
+            for (size_t i = 1; i < n; ++i) {
+                const double key = sorted[i];
+                size_t j = i;
+                while (j > 0 && sorted[j - 1] > key) {
+                    sorted[j] = sorted[j - 1];
+                    --j;
+                }
+                sorted[j] = key;
+            }
+
+            const size_t trim = n / 5;
+            const size_t lo = trim;
+            const size_t hi = (n > trim * 2) ? (n - trim) : n;
+            double sum = 0.0;
+            for (size_t i = lo; i < hi; ++i) sum += sorted[i];
+            const double trimmedMean = sum / static_cast<double>(std::max<size_t>(1, hi - lo));
+
+            const size_t p90Idx = (n > 1) ? ((n - 1) * 9 / 10) : 0;
+            const double upperSpread = std::max(0.0, sorted[p90Idx] - trimmedMean);
+
+            if (!hasSmoothedUniquePeriod_ || n <= 4) {
+                smoothedUniquePeriodMs_ = trimmedMean;
+                smoothedUniqueJitterMs_ = upperSpread;
+                hasSmoothedUniquePeriod_ = true;
+            } else {
+                smoothedUniquePeriodMs_ = smoothedUniquePeriodMs_ * 0.65 + trimmedMean * 0.35;
+                smoothedUniqueJitterMs_ = smoothedUniqueJitterMs_ * 0.75 + upperSpread * 0.25;
+            }
+        }
+    }
+
+    lastUniqueArrival_ = arrivalTime;
+    hasLastUniqueArrival_ = true;
+
+    outPeriodMs = hasSmoothedUniquePeriod_
+                      ? std::clamp(smoothedUniquePeriodMs_, 2.5, 160.0)
+                      : std::clamp(fallbackPeriodMs, 2.5, 160.0);
+    outJitterMs = hasSmoothedUniquePeriod_
+                      ? std::clamp(smoothedUniqueJitterMs_, 0.0, 40.0)
+                      : std::clamp(fallbackJitterMs, 0.0, 40.0);
+}
+
 bool FrameGenerator::startCaptureSession(bool autoSelectActiveWindow) {
     stopCaptureSession();
     try {
@@ -262,7 +570,44 @@ bool FrameGenerator::startCaptureSession(bool autoSelectActiveWindow) {
     }
 }
 
+void FrameGenerator::clearPrefetchedFrame() {
+    prefetchedValid_ = false;
+    prefetchedSlot_ = -1;
+    prefetchedFidx_ = 0;
+    prefetchedJitterMs_ = 0.0;
+    prefetchedArrival_ = {};
+    prefetchedStart_ = {};
+}
+
+void FrameGenerator::resetPacerState(bool keepTimingEma) {
+    nextPresentTime_ = {};
+    lastActualPresent_ = {};
+    lastStepMs_ = 0.0;
+    adaptivePhaseMs_ = 0.0;
+    paceMinMs_ = 1e9;
+    paceMaxMs_ = 0.0;
+    paceSumMs_ = 0.0;
+    paceCount_ = 0;
+    hasLastUniqueThumb_ = false;
+    hasLastUniqueArrival_ = false;
+    lastUniqueArrival_ = {};
+    uniqueDeltaCount_ = 0;
+    uniqueDeltaHead_ = 0;
+    uniqueRegimeShiftCount_ = 0;
+    hasSmoothedUniquePeriod_ = false;
+    smoothedUniquePeriodMs_ = 16.6667;
+    smoothedUniqueJitterMs_ = 0.0;
+    dupsDroppedInWindow_ = 0;
+    if (!keepTimingEma) {
+        firstPresentEmaMs_ = 0.0;
+        prepassEmaMs_ = 0.0;
+        genPassEmaMs_ = 0.0;
+    }
+}
+
 void FrameGenerator::stopCaptureSession() {
+    if (vk_) vk_->waitOneShotAsync();
+    clearPrefetchedFrame();
     if (capture_) {
         capture_->stop();
         capture_.reset();
@@ -274,8 +619,7 @@ void FrameGenerator::stopCaptureSession() {
     sessionActive_ = false;
     newestSlot_ = -1;
     lsfgFrameIndex_ = 0;
-    lastPresentTime_ = {};
-    lastStepMs_ = 0.0;
+    resetPacerState(false);
     lastPresentedOutputSlot_ = -1;
     adaptiveGpuCapMult_ = static_cast<double>(kMaxAdaptiveMultiplier);
     ++resourceEpoch_;
@@ -302,15 +646,14 @@ void FrameGenerator::handleControlAction(present::ControlAction action) {
                     break;
                 }
             }
+            if (vk_) vk_->waitOneShotAsync();
+            clearPrefetchedFrame();
+            resetPacerState(false);
             generating_ = true;
             newestSlot_ = -1;
             lsfgFrameIndex_ = 0;
             effectiveMultiplier_ = 0;
-            adaptiveAccum_ = 0.0;
             adaptiveGpuCapMult_ = static_cast<double>(kMaxAdaptiveMultiplier);
-            firstPresentEmaMs_ = 0.0;
-            lastPresentTime_ = {};
-            lastStepMs_ = 0.0;
             lastPresentedOutputSlot_ = -1;
             needsTargetAlign_ = true;
             // Do not map the overlay yet: it is mapped once the first captured frame is ready to be
@@ -328,8 +671,8 @@ void FrameGenerator::handleControlAction(present::ControlAction action) {
         case present::ControlAction::Stop: {
             generating_ = false;
             newestSlot_ = -1;
-            lastPresentTime_ = {};
-            lastStepMs_ = 0.0;
+            clearPrefetchedFrame();
+            resetPacerState(false);
             if (overlay_) overlay_->hide();
             stopCaptureSession();
             if (controlPanel_) controlPanel_->setGenerating(false);
@@ -340,7 +683,7 @@ void FrameGenerator::handleControlAction(present::ControlAction action) {
             options_.adaptive = false;
             options_.multiplier = 2;
             effectiveMultiplier_ = 0;
-            adaptiveAccum_ = 0.0;
+            adaptivePhaseMs_ = 0.0;
             adaptiveGpuCapMult_ = static_cast<double>(kMaxAdaptiveMultiplier);
             if (controlPanel_) {
                 controlPanel_->setMode(false, 2);
@@ -354,7 +697,7 @@ void FrameGenerator::handleControlAction(present::ControlAction action) {
             options_.adaptive = false;
             options_.multiplier = 3;
             effectiveMultiplier_ = 0;
-            adaptiveAccum_ = 0.0;
+            adaptivePhaseMs_ = 0.0;
             adaptiveGpuCapMult_ = static_cast<double>(kMaxAdaptiveMultiplier);
             if (controlPanel_) {
                 controlPanel_->setMode(false, 3);
@@ -368,7 +711,7 @@ void FrameGenerator::handleControlAction(present::ControlAction action) {
             options_.adaptive = false;
             options_.multiplier = 4;
             effectiveMultiplier_ = 0;
-            adaptiveAccum_ = 0.0;
+            adaptivePhaseMs_ = 0.0;
             adaptiveGpuCapMult_ = static_cast<double>(kMaxAdaptiveMultiplier);
             if (controlPanel_) {
                 controlPanel_->setMode(false, 4);
@@ -381,7 +724,7 @@ void FrameGenerator::handleControlAction(present::ControlAction action) {
         case present::ControlAction::SetModeAdaptive: {
             options_.adaptive = true;
             effectiveMultiplier_ = 0;
-            adaptiveAccum_ = 0.0;
+            adaptivePhaseMs_ = 0.0;
             adaptiveGpuCapMult_ = static_cast<double>(kMaxAdaptiveMultiplier);
             if (controlPanel_) {
                 controlPanel_->setMode(true, options_.multiplier);
@@ -405,7 +748,7 @@ void FrameGenerator::handleControlAction(present::ControlAction action) {
                 options_.multiplier = 2;
             }
             effectiveMultiplier_ = 0;
-            adaptiveAccum_ = 0.0;
+            adaptivePhaseMs_ = 0.0;
             adaptiveGpuCapMult_ = static_cast<double>(kMaxAdaptiveMultiplier);
             if (controlPanel_) {
                 controlPanel_->setMode(options_.adaptive, options_.multiplier);
@@ -425,7 +768,7 @@ void FrameGenerator::handleControlAction(present::ControlAction action) {
             targetFpsAutoInit_ = false;
             int step = (options_.targetFps > 240) ? 20 : 10;
             options_.targetFps = std::clamp(options_.targetFps - step, 30, kMaxTargetFps);
-            adaptiveAccum_ = 0.0;
+            adaptivePhaseMs_ = 0.0;
             adaptiveGpuCapMult_ = static_cast<double>(kMaxAdaptiveMultiplier);
             if (controlPanel_) {
                 controlPanel_->setMode(true, options_.multiplier);
@@ -440,7 +783,7 @@ void FrameGenerator::handleControlAction(present::ControlAction action) {
             targetFpsAutoInit_ = false;
             int step = (options_.targetFps >= 240) ? 20 : 10;
             options_.targetFps = std::clamp(options_.targetFps + step, 30, kMaxTargetFps);
-            adaptiveAccum_ = 0.0;
+            adaptivePhaseMs_ = 0.0;
             adaptiveGpuCapMult_ = static_cast<double>(kMaxAdaptiveMultiplier);
             if (controlPanel_) {
                 controlPanel_->setMode(true, options_.multiplier);
@@ -469,7 +812,7 @@ void FrameGenerator::handleControlAction(present::ControlAction action) {
                 }
             }
             options_.targetFps = nextTarget;
-            adaptiveAccum_ = 0.0;
+            adaptivePhaseMs_ = 0.0;
             adaptiveGpuCapMult_ = static_cast<double>(kMaxAdaptiveMultiplier);
             if (controlPanel_) {
                 controlPanel_->setMode(true, options_.multiplier);
@@ -572,6 +915,8 @@ void FrameGenerator::handleControlAction(present::ControlAction action) {
             adaptiveGpuCapMult_ = static_cast<double>(kMaxAdaptiveMultiplier);
             if (overlay_) {
                 if (vk_) vk_->waitOneShotAsync();
+                clearPrefetchedFrame();
+                resetPacerState(true);
                 lastPresentedOutputSlot_ = -1;
                 ++resourceEpoch_;
                 overlay_->setVsync(options_.vsync);
@@ -597,7 +942,12 @@ void FrameGenerator::handleControlAction(present::ControlAction action) {
             }
             options_.dllPath = resolved.string();
             if (vk_) {
+                vk_->waitOneShotAsync();
+                clearPrefetchedFrame();
+                resetPacerState(false);
                 vkDeviceWaitIdle(vk_->device());
+                lastPresentedOutputSlot_ = -1;
+                ++resourceEpoch_;
                 lsfg_ = std::make_unique<compute::LsfgPipeline>(*vk_, options_.dllPath);
             }
             if (lsfg_ && lsfg_->isAvailable()) {
@@ -630,7 +980,12 @@ void FrameGenerator::handleControlAction(present::ControlAction action) {
             }
             options_.dllPath = found.string();
             if (vk_) {
+                vk_->waitOneShotAsync();
+                clearPrefetchedFrame();
+                resetPacerState(false);
                 vkDeviceWaitIdle(vk_->device());
+                lastPresentedOutputSlot_ = -1;
+                ++resourceEpoch_;
                 lsfg_ = std::make_unique<compute::LsfgPipeline>(*vk_, options_.dllPath);
             }
             if (lsfg_ && lsfg_->isAvailable()) {
@@ -670,7 +1025,9 @@ bool FrameGenerator::ensureResources(uint32_t width, uint32_t height, const capt
     }
 
     vk_->waitOneShotAsync();
+    clearPrefetchedFrame();
     vkDeviceWaitIdle(vk_->device());
+    resetPacerState(true);
     lastPresentedOutputSlot_ = -1;
     adaptiveGpuCapMult_ = static_cast<double>(kMaxAdaptiveMultiplier);
     ++resourceEpoch_;
@@ -729,6 +1086,7 @@ bool FrameGenerator::ensureResources(uint32_t width, uint32_t height, const capt
         frameWidth_ = width;
         frameHeight_ = height;
 
+        ensureThumbResources();
         configureLsfgResources();
 
         if (!overlay_) {
@@ -762,7 +1120,9 @@ void FrameGenerator::configureLsfgResources() {
     }
     options_.flowScale = std::clamp(options_.flowScale, 25, 100);
     vk_->waitOneShotAsync();
+    clearPrefetchedFrame();
     vkDeviceWaitIdle(vk_->device());
+    resetPacerState(true);
     lastPresentedOutputSlot_ = -1;
     adaptiveGpuCapMult_ = static_cast<double>(kMaxAdaptiveMultiplier);
     ++resourceEpoch_;
@@ -912,21 +1272,7 @@ void FrameGenerator::uploadViaStagingBuffer(const capture::CaptureBuffer& buffer
     copyRegion.imageExtent = {w, h, 1};
     vkCmdCopyBufferToImage(cmd, stagingBuffer_, slot.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
 
-    VkImageMemoryBarrier2 toGeneral{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-    toGeneral.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-    toGeneral.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    toGeneral.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    toGeneral.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-    toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toGeneral.image = slot.image;
-    toGeneral.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    VkDependencyInfo dep2{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    dep2.imageMemoryBarrierCount = 1;
-    dep2.pImageMemoryBarriers = &toGeneral;
-    vkCmdPipelineBarrier2(cmd, &dep2);
+    recordThumbDownsample(cmd, slot.image, w, h);
 
     vk_->endOneShotCommands(vk_->graphicsCommandPool(), vk_->graphicsPresentQueue(), cmd);
 }
@@ -990,21 +1336,7 @@ void FrameGenerator::copyIntoSlot(const capture::CaptureBuffer& buffer, FrameSlo
                 vkCmdBlitImage(cmd, imported.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot.image,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
 
-                VkImageMemoryBarrier2 toGeneral{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-                toGeneral.srcStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
-                toGeneral.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-                toGeneral.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-                toGeneral.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-                toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-                toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                toGeneral.image = slot.image;
-                toGeneral.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                VkDependencyInfo dep2{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-                dep2.imageMemoryBarrierCount = 1;
-                dep2.pImageMemoryBarriers = &toGeneral;
-                vkCmdPipelineBarrier2(cmd, &dep2);
+                recordThumbDownsample(cmd, slot.image, buffer.width, buffer.height);
 
                 vk_->endOneShotCommands(vk_->graphicsCommandPool(), vk_->graphicsPresentQueue(), cmd);
             } catch (...) {
@@ -1035,15 +1367,28 @@ void FrameGenerator::copyIntoSlot(const capture::CaptureBuffer& buffer, FrameSlo
     if (buffer.isDmaBuf) syncDmaBufRead(primaryFd, false);
 }
 
-bool FrameGenerator::waitUntilTime(std::chrono::steady_clock::time_point targetTime) {
+bool FrameGenerator::waitUntilTime(std::chrono::steady_clock::time_point targetTime,
+                                   bool allowPrefetch, int currentSlot, uint64_t nextFidx) {
     using Clock = std::chrono::steady_clock;
 
     while (running_ && generating_) {
         auto now = Clock::now();
         if (now >= targetTime) break;
 
-        if (lastUiPollTime_.time_since_epoch().count() == 0 ||
-            now - lastUiPollTime_ >= std::chrono::milliseconds(8)) {
+        auto remUs = std::chrono::duration_cast<std::chrono::microseconds>(targetTime - now).count();
+
+        if (allowPrefetch && !prefetchedValid_ && remUs >= 2000 &&
+            capture_ && capture_->hasPendingFrame() &&
+            vk_ && vk_->pollOneShotAsyncComplete()) {
+            tryPrefetchNextFrame(currentSlot, nextFidx);
+            now = Clock::now();
+            if (now >= targetTime) break;
+            remUs = std::chrono::duration_cast<std::chrono::microseconds>(targetTime - now).count();
+        }
+
+        if (remUs > 1500 &&
+            (lastUiPollTime_.time_since_epoch().count() == 0 ||
+             now - lastUiPollTime_ >= std::chrono::milliseconds(16))) {
             lastUiPollTime_ = now;
             int sigAct = pendingSignalAction_.exchange(0);
             if (sigAct == 1) handleControlAction(present::ControlAction::Start);
@@ -1066,9 +1411,9 @@ bool FrameGenerator::waitUntilTime(std::chrono::steady_clock::time_point targetT
             if (!generating_ || !running_) return false;
             now = Clock::now();
             if (now >= targetTime) break;
+            remUs = std::chrono::duration_cast<std::chrono::microseconds>(targetTime - now).count();
         }
 
-        auto remUs = std::chrono::duration_cast<std::chrono::microseconds>(targetTime - now).count();
         if (remUs > 700) {
             std::this_thread::sleep_for(std::chrono::microseconds(std::min<int64_t>(remUs - 500, 1500)));
         } else {
@@ -1078,6 +1423,64 @@ bool FrameGenerator::waitUntilTime(std::chrono::steady_clock::time_point targetT
         }
     }
     return running_ && generating_;
+}
+
+bool FrameGenerator::tryPrefetchNextFrame(int currentSlot, uint64_t nextFidx) {
+    if (prefetchedValid_ || !generating_ || !running_ ||
+        !capture_ || !vk_ || !lsfg_ || !lsfg_->isAvailable() || !lsfg_->isConfigured()) {
+        return false;
+    }
+    if (currentSlot < 0 || vk_->isOneShotAsyncPending()) return false;
+    const int nextSlot = (currentSlot == 0) ? 1 : 0;
+    if (slots_[nextSlot].image == VK_NULL_HANDLE) return false;
+
+    capture::CaptureBuffer nextBuf;
+    if (!capture_->tryTakeBuffer(nextBuf)) return false;
+
+    if (!generating_ || !running_ || nextBuf.width != frameWidth_ || nextBuf.height != frameHeight_) {
+        capture_->releaseBuffer(nextBuf);
+        return false;
+    }
+
+    const auto pfStart = std::chrono::steady_clock::now();
+    try {
+        copyIntoSlot(nextBuf, slots_[nextSlot]);
+    } catch (...) {
+        capture_->releaseBuffer(nextBuf);
+        return false;
+    }
+    const double rawPeriodMs = nextBuf.producerPeriodMs;
+    const double rawJitterMs = nextBuf.producerJitterMs;
+    const auto arrival = (nextBuf.arrivalTime.time_since_epoch().count() != 0) ? nextBuf.arrivalTime : pfStart;
+    capture_->releaseBuffer(nextBuf);
+
+    if (isCurrentThumbDuplicate()) {
+        ++dupsDroppedInWindow_;
+        return false;
+    }
+    commitCurrentThumb();
+
+    double periodMs = 16.6667;
+    double jitterMs = 0.0;
+    recordUniqueFrameTiming(arrival, rawPeriodMs, rawJitterMs, periodMs, jitterMs);
+
+    uint64_t fidx = nextFidx;
+    if ((fidx & 1u) != static_cast<uint64_t>(nextSlot)) {
+        ++fidx;
+    }
+
+    VkCommandBuffer preCmd = vk_->beginOneShotCommands(vk_->graphicsCommandPool());
+    lsfg_->recordPrepassOnly(preCmd, fidx);
+    vk_->submitOneShotAsync(vk_->graphicsPresentQueue(), preCmd);
+
+    prefetchedValid_ = true;
+    prefetchedSlot_ = nextSlot;
+    prefetchedFidx_ = fidx;
+    prefetchedPeriodMs_ = periodMs;
+    prefetchedJitterMs_ = jitterMs;
+    prefetchedArrival_ = arrival;
+    prefetchedStart_ = pfStart;
+    return true;
 }
 
 void FrameGenerator::run() {
@@ -1132,8 +1535,78 @@ void FrameGenerator::run() {
         if (!running_) break;
 
         if (!sessionActive_ || !capture_) {
+            if (vk_) vk_->waitOneShotAsync();
+            clearPrefetchedFrame();
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
+        }
+
+        if (prefetchedValid_) {
+            const int pfSlot = prefetchedSlot_;
+            const uint64_t pfFidx = prefetchedFidx_;
+            const double pfPeriodMs = prefetchedPeriodMs_;
+            const double pfJitterMs = prefetchedJitterMs_;
+            const auto pfArrival = prefetchedArrival_;
+            const auto pfStart = prefetchedStart_;
+            clearPrefetchedFrame();
+
+            if (generating_ && pfSlot >= 0 && lsfg_ && lsfg_->isAvailable() && lsfg_->isConfigured()) {
+                newestSlot_ = pfSlot;
+                lsfgFrameIndex_ = pfFidx;
+                lastRealFrameTime = pfStart;
+                if (overlay_) overlay_->show();
+
+                const int presented = renderCycle(slots_[newestSlot_], pfStart, pfArrival, pfPeriodMs, pfJitterMs, true);
+                ++cycles;
+                ++capturedInWindow;
+                presentedInWindow += static_cast<uint32_t>(std::max(0, presented));
+
+                auto afterCycle = std::chrono::steady_clock::now();
+                double windowSec = std::chrono::duration<double>(afterCycle - fpsWindowStart).count();
+                if (windowSec >= 0.25) {
+                    float capFps = static_cast<float>(capturedInWindow / windowSec);
+                    float outFps = static_cast<float>(presentedInWindow / windowSec);
+                    if (overlay_) overlay_->setFps(capFps, outFps);
+                    if (controlPanel_) {
+                        controlPanel_->setFps(static_cast<int>(std::lround(capFps)),
+                                              static_cast<int>(std::lround(outFps)));
+                    }
+
+                    if (std::chrono::duration<double>(afterCycle - termLogStart).count() >= 1.0) {
+                        const double hz = overlay_ ? overlay_->refreshRateHz() : 0.0;
+                        const double avgPace = paceCount_ > 0 ? (paceSumMs_ / static_cast<double>(paceCount_)) : 0.0;
+                        const double minPace = paceCount_ > 0 ? paceMinMs_ : 0.0;
+                        const double maxPace = paceCount_ > 0 ? paceMaxMs_ : 0.0;
+                        if (options_.adaptive) {
+                            std::fprintf(stderr, "[lfg] ADAPTIVE (target %d, %dx, flow %d%%) FPS (%s): %.1f -> %.1f "
+                                         "(source period %.1f ms, display %.0f Hz, gpu synth %.1f ms, pace %.2f/%.2f/%.2f ms, dups %u)\n",
+                                         options_.targetFps, effectiveMultiplier_ > 0 ? effectiveMultiplier_ : 1,
+                                         options_.flowScale, vk_->selectedGpuInfo().shortLabel.c_str(),
+                                         capFps, outFps, pfPeriodMs, hz, firstPresentEmaMs_,
+                                         minPace, avgPace, maxPace, dupsDroppedInWindow_);
+                        } else {
+                            std::fprintf(stderr, "[lfg] %dX (flow %d%%) FPS (%s): %.1f -> %.1f "
+                                         "(source period %.1f ms, display %.0f Hz, gpu synth %.1f ms, pace %.2f/%.2f/%.2f ms, dups %u)\n",
+                                         effectiveMultiplier_ > 0 ? effectiveMultiplier_ : options_.multiplier,
+                                         options_.flowScale, vk_->selectedGpuInfo().shortLabel.c_str(), capFps, outFps,
+                                         pfPeriodMs, hz, firstPresentEmaMs_, minPace, avgPace, maxPace,
+                                         dupsDroppedInWindow_);
+                        }
+                        paceMinMs_ = 1e9;
+                        paceMaxMs_ = 0.0;
+                        paceSumMs_ = 0.0;
+                        paceCount_ = 0;
+                        dupsDroppedInWindow_ = 0;
+                        termLogStart = afterCycle;
+                    }
+                    fpsWindowStart = afterCycle;
+                    capturedInWindow = 0;
+                    presentedInWindow = 0;
+                }
+                continue;
+            } else if (vk_) {
+                vk_->waitOneShotAsync();
+            }
         }
 
         capture::CaptureBuffer buffer;
@@ -1174,7 +1647,7 @@ void FrameGenerator::run() {
             }
             const auto computeStart = std::chrono::steady_clock::now();
             if (lastRealFrameTime.time_since_epoch().count() != 0 &&
-                std::chrono::duration<double, std::milli>(computeStart - lastRealFrameTime).count() < 90.0) {
+                std::chrono::duration<double, std::milli>(computeStart - lastRealFrameTime).count() < 250.0) {
                 continue;
             }
             // When a browser or window is steady / not sending new PipeWire frames, keep applying
@@ -1263,7 +1736,7 @@ void FrameGenerator::run() {
             }
 
             const double steadyPeriodMs = 16.6667;
-            const int presented = renderCycle(slots_[newestSlot_], computeStart, steadyPeriodMs, 0.0);
+            const int presented = renderCycle(slots_[newestSlot_], computeStart, computeStart, steadyPeriodMs, 0.0, false);
             ++cycles;
             ++capturedInWindow;
             presentedInWindow += static_cast<uint32_t>(std::max(0, presented));
@@ -1291,21 +1764,15 @@ void FrameGenerator::run() {
         }
 
         const auto computeStart = std::chrono::steady_clock::now();
-        lastRealFrameTime = computeStart;
-        double queueLagMs = 0.0;
-        if (buffer.arrivalTime.time_since_epoch().count() != 0 &&
-            buffer.arrivalTime <= computeStart &&
-            computeStart - buffer.arrivalTime < std::chrono::milliseconds(85)) {
-            queueLagMs = std::chrono::duration<double, std::milli>(computeStart - buffer.arrivalTime).count();
-        }
-        double producerPeriodMs = std::clamp(buffer.producerPeriodMs, 4.0, 100.0);
+        const auto arrivalTime = (buffer.arrivalTime.time_since_epoch().count() != 0) ? buffer.arrivalTime : computeStart;
+        double producerPeriodMs = std::clamp(buffer.producerPeriodMs, 2.5, 160.0);
+        double producerJitterMs = std::clamp(buffer.producerJitterMs, 0.0, 40.0);
 
         bool resourcesReady = false;
         try {
             if (ensureResources(buffer.width, buffer.height, currentTarget_)) {
                 newestSlot_ = -1;
-                lastPresentTime_ = {};
-                lastStepMs_ = 0.0;
+                resetPacerState(true);
             } else if (needsTargetAlign_) {
                 if (overlay_) {
                     present::TargetRect requestedRect{currentTarget_.x, currentTarget_.y, buffer.width, buffer.height};
@@ -1336,10 +1803,11 @@ void FrameGenerator::run() {
         }
 
         bool copied = false;
+        int copiedSlot = -1;
         try {
             const int slotIndex = (newestSlot_ == 0) ? 1 : 0;
             copyIntoSlot(buffer, slots_[slotIndex]);
-            newestSlot_ = slotIndex;
+            copiedSlot = slotIndex;
             copied = true;
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[lfg] could not import/copy a captured frame: %s\n", e.what());
@@ -1390,6 +1858,31 @@ void FrameGenerator::run() {
             continue;
         }
         consecutiveFailures = 0;
+
+        if (newestSlot_ >= 0 && isCurrentThumbDuplicate()) {
+            const double sinceLastMs =
+                (lastRealFrameTime.time_since_epoch().count() != 0)
+                    ? std::chrono::duration<double, std::milli>(computeStart - lastRealFrameTime).count()
+                    : 0.0;
+            if (sinceLastMs < 250.0) {
+                ++dupsDroppedInWindow_;
+                continue;
+            }
+            // Genuinely static/paused scene (>= 250 ms): keep presenting at 60 Hz keepalive
+            // without polluting the unique-frame period/jitter estimator.
+            newestSlot_ = copiedSlot;
+            commitCurrentThumb();
+            lastRealFrameTime = computeStart;
+            producerPeriodMs = 16.6667;
+            producerJitterMs = 0.0;
+        } else {
+            newestSlot_ = copiedSlot;
+            commitCurrentThumb();
+            lastRealFrameTime = computeStart;
+            recordUniqueFrameTiming(arrivalTime, producerPeriodMs, producerJitterMs,
+                                    producerPeriodMs, producerJitterMs);
+        }
+
         if (overlay_ && generating_) overlay_->show();
 
         const int previous = (newestSlot_ == 0) ? 1 : 0;
@@ -1404,8 +1897,11 @@ void FrameGenerator::run() {
                 if (overlay_) {
                     overlay_->waitForIdle();
                     if (overlay_->presentImage(slots_[newestSlot_].image, VK_IMAGE_LAYOUT_GENERAL, frameWidth_, frameHeight_)) {
-                        lastPresentTime_ = std::chrono::steady_clock::now();
-                        lastStepMs_ = producerPeriodMs * 0.5;
+                        const auto now = std::chrono::steady_clock::now();
+                        lastActualPresent_ = now;
+                        const double initStep = producerPeriodMs * 0.5;
+                        lastStepMs_ = initStep;
+                        nextPresentTime_ = now + std::chrono::microseconds(static_cast<int64_t>(initStep * 1000.0));
                     }
                     lastPresentedOutputSlot_ = -1;
                 }
@@ -1421,7 +1917,7 @@ void FrameGenerator::run() {
             ++lsfgFrameIndex_;
         }
 
-        const int presented = renderCycle(slots_[newestSlot_], computeStart, producerPeriodMs, queueLagMs);
+        const int presented = renderCycle(slots_[newestSlot_], computeStart, arrivalTime, producerPeriodMs, producerJitterMs, false);
         ++cycles;
 
         ++capturedInWindow;
@@ -1440,19 +1936,29 @@ void FrameGenerator::run() {
 
             if (std::chrono::duration<double>(afterCycle - termLogStart).count() >= 1.0) {
                 const double hz = overlay_ ? overlay_->refreshRateHz() : 0.0;
+                const double avgPace = paceCount_ > 0 ? (paceSumMs_ / static_cast<double>(paceCount_)) : 0.0;
+                const double minPace = paceCount_ > 0 ? paceMinMs_ : 0.0;
+                const double maxPace = paceCount_ > 0 ? paceMaxMs_ : 0.0;
                 if (options_.adaptive) {
-                    std::fprintf(stderr, "[lfg] ADAPTIVE (target %d, %dx, flow %d%%) FPS (%s): %.1f -> %.1f (source period %.1f ms, "
-                                 "display %.0f Hz, gpu synth %.1f ms)\n",
+                    std::fprintf(stderr, "[lfg] ADAPTIVE (target %d, %dx, flow %d%%) FPS (%s): %.1f -> %.1f "
+                                 "(source period %.1f ms, display %.0f Hz, gpu synth %.1f ms, pace %.2f/%.2f/%.2f ms, dups %u)\n",
                                  options_.targetFps, effectiveMultiplier_ > 0 ? effectiveMultiplier_ : 1,
                                  options_.flowScale, vk_->selectedGpuInfo().shortLabel.c_str(),
-                                 capFps, outFps, producerPeriodMs, hz, firstPresentEmaMs_);
+                                 capFps, outFps, producerPeriodMs, hz, firstPresentEmaMs_,
+                                 minPace, avgPace, maxPace, dupsDroppedInWindow_);
                 } else {
-                    std::fprintf(stderr, "[lfg] %dX (flow %d%%) FPS (%s): %.1f -> %.1f (source period %.1f ms, "
-                                 "display %.0f Hz, gpu synth %.1f ms)\n",
+                    std::fprintf(stderr, "[lfg] %dX (flow %d%%) FPS (%s): %.1f -> %.1f "
+                                 "(source period %.1f ms, display %.0f Hz, gpu synth %.1f ms, pace %.2f/%.2f/%.2f ms, dups %u)\n",
                                  effectiveMultiplier_ > 0 ? effectiveMultiplier_ : options_.multiplier,
                                  options_.flowScale, vk_->selectedGpuInfo().shortLabel.c_str(), capFps, outFps,
-                                 producerPeriodMs, hz, firstPresentEmaMs_);
+                                 producerPeriodMs, hz, firstPresentEmaMs_, minPace, avgPace, maxPace,
+                                 dupsDroppedInWindow_);
                 }
+                paceMinMs_ = 1e9;
+                paceMaxMs_ = 0.0;
+                paceSumMs_ = 0.0;
+                paceCount_ = 0;
+                dupsDroppedInWindow_ = 0;
                 termLogStart = afterCycle;
             }
             fpsWindowStart = afterCycle;
@@ -1465,181 +1971,288 @@ void FrameGenerator::run() {
     stopCaptureSession();
 }
 
-int FrameGenerator::computeEffectiveMultiplier(double framePeriodMs) {
-    // 1. Adaptive Mode: dynamically vary per-cycle multiplier (1..42) via fractional accumulator
-    //    so average output framerate locks onto `options_.targetFps` (e.g. 24 -> 500+ FPS).
-    if (options_.adaptive) {
-        double targetFps = std::clamp(static_cast<double>(options_.targetFps), 30.0, static_cast<double>(kMaxTargetFps));
-        double targetPeriodMs = 1000.0 / targetFps;
-        double gpuCap = std::clamp(adaptiveGpuCapMult_, 2.0, static_cast<double>(kMaxAdaptiveMultiplier));
-        double desiredRatio = std::clamp(framePeriodMs / targetPeriodMs, 1.0, gpuCap);
-
-        if (desiredRatio <= 1.05) {
-            adaptiveAccum_ = 0.0;
-            effectiveMultiplier_ = 1;
-            return 1;
-        }
-
-        double total = desiredRatio + adaptiveAccum_;
-        int mult = std::clamp(static_cast<int>(std::floor(total + 1e-4)), 1, kMaxAdaptiveMultiplier);
-        adaptiveAccum_ = std::clamp(total - static_cast<double>(mult), 0.0, 0.9999);
-        effectiveMultiplier_ = mult;
-        return mult;
-    }
-
-    // 2. Fixed Multiplier Mode (2X..20X):
-    //    Always honor the user's selected multiplier so both generated and real frames are produced.
-    const int requested = std::clamp(options_.multiplier, 2, kMaxMultiplier);
-    effectiveMultiplier_ = requested;
-    return requested;
-}
-
 int FrameGenerator::renderCycle(const FrameSlot& newest,
                                 std::chrono::steady_clock::time_point computeStart,
-                                double framePeriodMs, double queueLagMs) {
+                                std::chrono::steady_clock::time_point arrivalTime,
+                                double framePeriodMs,
+                                double producerJitterMs,
+                                bool prepassAlreadySubmitted) {
     using Clock = std::chrono::steady_clock;
     auto toDuration = [](double ms) {
         return std::chrono::microseconds(static_cast<int64_t>(ms * 1000.0));
     };
 
     if (!overlay_ || !lsfg_ || !lsfg_->isAvailable() || !lsfg_->isConfigured()) return 0;
-    const int mult = computeEffectiveMultiplier(framePeriodMs);
 
-    if (mult <= 1) {
-        VkCommandBuffer preCmd = vk_->beginOneShotCommands(vk_->graphicsCommandPool());
-        lsfg_->recordPrepassOnly(preCmd, lsfgFrameIndex_++);
-        vk_->endOneShotCommands(vk_->graphicsCommandPool(), vk_->graphicsPresentQueue(), preCmd);
-        if (!overlay_ || newestSlot_ < 0) return 0;
-        bool ok = overlay_->presentImage(newest.image, VK_IMAGE_LAYOUT_GENERAL, frameWidth_, frameHeight_);
-        lastPresentedOutputSlot_ = -1;
-        if (ok) {
-            lastPresentTime_ = Clock::now();
-            lastStepMs_ = framePeriodMs;
+    struct PresentStep {
+        float t = 1.0f;
+        bool useNewest = false;
+        bool usePrevious = false;
+    };
+
+    std::vector<PresentStep> steps;
+    double baseStepMs = framePeriodMs;
+
+    if (options_.adaptive) {
+        const double targetFps = std::clamp(static_cast<double>(options_.targetFps), 30.0,
+                                            static_cast<double>(kMaxTargetFps));
+        const double targetStepMs = 1000.0 / targetFps;
+        const double gpuCap = std::clamp(adaptiveGpuCapMult_, 2.0,
+                                         static_cast<double>(kMaxAdaptiveMultiplier));
+        baseStepMs = std::max(targetStepMs, framePeriodMs / gpuCap);
+
+        if (framePeriodMs <= baseStepMs * 1.04) {
+            adaptivePhaseMs_ = 0.0;
+            effectiveMultiplier_ = 1;
+            steps.push_back(PresentStep{1.0f, true, false});
+            baseStepMs = framePeriodMs;
+        } else {
+            double tau = (adaptivePhaseMs_ > 0.0 && adaptivePhaseMs_ <= baseStepMs)
+                             ? adaptivePhaseMs_
+                             : baseStepMs;
+            while (tau <= framePeriodMs + 1e-4 &&
+                   static_cast<int>(steps.size()) < kMaxAdaptiveMultiplier) {
+                const float t = static_cast<float>(tau / framePeriodMs);
+                if (t <= 0.05f) {
+                    steps.push_back(PresentStep{0.0f, false, true});
+                } else if (t >= 0.95f) {
+                    steps.push_back(PresentStep{1.0f, true, false});
+                } else {
+                    steps.push_back(PresentStep{t, false, false});
+                }
+                tau += baseStepMs;
+            }
+            if (steps.empty()) {
+                steps.push_back(PresentStep{1.0f, true, false});
+            }
+            adaptivePhaseMs_ = std::clamp(tau - framePeriodMs, 1e-3, baseStepMs);
+            effectiveMultiplier_ = static_cast<int>(steps.size());
         }
-        return ok ? 1 : 0;
+    } else {
+        const int mult = std::clamp(options_.multiplier, 2, kMaxMultiplier);
+        effectiveMultiplier_ = mult;
+        baseStepMs = framePeriodMs / static_cast<double>(mult);
+        steps.reserve(static_cast<size_t>(mult));
+        for (int k = 1; k < mult; ++k) {
+            steps.push_back(PresentStep{static_cast<float>(k) / static_cast<float>(mult), false, false});
+        }
+        steps.push_back(PresentStep{1.0f, true, false});
+    }
+
+    int totalPresents = static_cast<int>(steps.size());
+
+    // Compute continuous PLL step duration and phase lead relative to real-frame arrival.
+    const double estSynthMs = (firstPresentEmaMs_ > 0.0) ? firstPresentEmaMs_ : 5.0;
+    const double jitterMarginMs = std::clamp(
+        std::max(framePeriodMs * 0.10, producerJitterMs * 1.35 + 1.5),
+        2.0, std::min(framePeriodMs * 0.45, 18.0));
+    const double targetLeadMs = std::clamp(
+        estSynthMs + 1.0 + jitterMarginMs,
+        3.0, std::max(framePeriodMs * 0.65, 14.0));
+
+    const auto arrivalAnchor =
+        (arrivalTime.time_since_epoch().count() != 0 &&
+         arrivalTime <= computeStart &&
+         (computeStart - arrivalTime) < std::chrono::milliseconds(150))
+            ? arrivalTime
+            : computeStart;
+    const auto idealFirstPresent = arrivalAnchor + toDuration(targetLeadMs);
+
+    double stepMs = std::max(0.25, baseStepMs);
+    {
+        const auto nowInit = Clock::now();
+        const bool hasNextAnchor =
+            (nextPresentTime_.time_since_epoch().count() != 0) &&
+            (std::abs(std::chrono::duration<double, std::milli>(nextPresentTime_ - nowInit).count()) < 120.0);
+
+        if (!hasNextAnchor) {
+            nextPresentTime_ = std::max(nowInit, idealFirstPresent);
+        } else if (nextPresentTime_ < nowInit) {
+            const auto minFloor = (lastActualPresent_.time_since_epoch().count() != 0)
+                                      ? (lastActualPresent_ + toDuration(baseStepMs * 0.92))
+                                      : nowInit;
+            nextPresentTime_ = std::max(nowInit, minFloor);
+        } else {
+            const double phaseErrMs =
+                std::chrono::duration<double, std::milli>(nextPresentTime_ - idealFirstPresent).count();
+            const double maxErrMs = std::max(framePeriodMs * 1.8, 70.0);
+            if (std::abs(phaseErrMs) > maxErrMs) {
+                const auto minFloor = (lastActualPresent_.time_since_epoch().count() != 0)
+                                          ? (lastActualPresent_ + toDuration(baseStepMs * 0.92))
+                                          : nowInit;
+                nextPresentTime_ = std::max({nowInit, minFloor, idealFirstPresent});
+            } else {
+                const double corrMs = std::clamp(-phaseErrMs * 0.18 / static_cast<double>(totalPresents),
+                                                 -0.08 * baseStepMs, 0.08 * baseStepMs);
+                stepMs = std::max(0.25, baseStepMs + corrMs);
+            }
+        }
     }
 
     struct AsyncGuard {
         FrameGenerator* self;
+        bool keepOnExit = false;
         void wait() {
             if (self->vk_ && self->vk_->isOneShotAsyncPending()) {
                 self->vk_->waitOneShotAsync();
             }
         }
-        ~AsyncGuard() { wait(); }
+        ~AsyncGuard() {
+            if (!keepOnExit) wait();
+        }
     } asyncCompute{this};
 
     const uint64_t fidx = lsfgFrameIndex_++;
     const uint64_t cycleEpoch = resourceEpoch_;
-    const int genCount = mult - 1;
-    const int totalPresents = genCount + 1;
+    bool prepassInFlight = false;
+    bool genInFlight = false;
+    uint32_t pendingGenSlot = 0u;
+    auto firstSubmitTime = computeStart;
+    bool firstGenMeasured = false;
 
-    // Kick off Prepass + first intermediate frame (slot 0) asynchronously while the previous real frame displays.
-    if (lastPresentedOutputSlot_ == 0) {
-        overlay_->waitForIdle();
-        lastPresentedOutputSlot_ = -1;
-    }
-    {
+    const bool firstIsGen = (!steps[0].useNewest && !steps[0].usePrevious);
+    if (firstIsGen) {
+        if (prepassAlreadySubmitted) {
+            asyncCompute.wait();
+            const double preMs =
+                std::chrono::duration<double, std::milli>(Clock::now() - computeStart).count();
+            prepassEmaMs_ = (prepassEmaMs_ <= 0.0) ? preMs : (prepassEmaMs_ * 0.85 + preMs * 0.15);
+        }
+        const uint32_t firstSlot = (lastPresentedOutputSlot_ == 0) ? 1u : 0u;
+        if (lastPresentedOutputSlot_ == static_cast<int>(firstSlot)) {
+            overlay_->waitForIdle();
+            lastPresentedOutputSlot_ = -1;
+        }
         VkCommandBuffer firstCmd = vk_->beginOneShotCommands(vk_->graphicsCommandPool());
-        lsfg_->recordPrepassOnly(firstCmd, fidx);
-        const float t0 = 1.0f / static_cast<float>(totalPresents);
-        lsfg_->recordGeneratePass(firstCmd, fidx, t0, 0u);
+        if (!prepassAlreadySubmitted) {
+            lsfg_->recordPrepassOnly(firstCmd, fidx);
+        }
+        lsfg_->recordGeneratePass(firstCmd, fidx, steps[0].t, firstSlot);
+        firstSubmitTime = Clock::now();
         vk_->submitOneShotAsync(vk_->graphicsPresentQueue(), firstCmd);
+        pendingGenSlot = firstSlot;
+        genInFlight = true;
+    } else if (!prepassAlreadySubmitted) {
+        VkCommandBuffer preCmd = vk_->beginOneShotCommands(vk_->graphicsCommandPool());
+        lsfg_->recordPrepassOnly(preCmd, fidx);
+        firstSubmitTime = Clock::now();
+        vk_->submitOneShotAsync(vk_->graphicsPresentQueue(), preCmd);
+        prepassInFlight = true;
+    } else {
+        prepassInFlight = true;
     }
-
-    // Phase-Locked Loop (PLL) Frame Pacer:
-    // Divide the source frame period evenly across all (genCount + 1) output frames with sub-ms support:
-    //   lastRealPresent -> +stepMs -> Gen_1 -> +stepMs -> ... -> Gen_K -> +stepMs -> Real_cur
-    const double idealStepMs = framePeriodMs / static_cast<double>(totalPresents);
-    const double pllTrimMs = std::clamp((queueLagMs - 0.8) / static_cast<double>(totalPresents + 1),
-                                        0.0, idealStepMs * 0.18);
-    const double stepMs = std::max(0.25, idealStepMs - pllTrimMs);
-    const double cycleTargetMs = std::max(1.0, framePeriodMs - pllTrimMs * static_cast<double>(totalPresents));
 
     int presented = 0;
     bool preempted = false;
     for (int k = 0; k < totalPresents; ++k) {
-        const bool isReal = (k == totalPresents - 1);
-        const auto nowBeforeWait = Clock::now();
-        const double elapsedCycleMs =
-            std::chrono::duration<double, std::milli>(nowBeforeWait - computeStart).count();
-        const double remainingCycleMs = std::max(0.0, cycleTargetMs - elapsedCycleMs);
-        const double budgetStepMs = remainingCycleMs / static_cast<double>(totalPresents - k);
-        const double waitIntervalMs =
-            (k == 0)
-                ? ((lastStepMs_ > 0.0) ? std::min(lastStepMs_, stepMs) : stepMs)
-                : std::max(0.25, std::min(stepMs, budgetStepMs));
+        const auto targetPresentTime = nextPresentTime_;
+        const bool isLast = (k == totalPresents - 1);
+        const bool isGen = (!steps[k].useNewest && !steps[k].usePrevious);
+        const bool allowPrefetch =
+            (isLast && totalPresents > 1 && !prefetchedValid_ && !steps[k].usePrevious);
 
-        const bool hasAnchor =
-            (lastPresentTime_.time_since_epoch().count() != 0) &&
-            (std::chrono::duration<double, std::milli>(nowBeforeWait - lastPresentTime_).count() < 120.0);
-        const auto targetPresentTime =
-            hasAnchor ? (lastPresentTime_ + toDuration(waitIntervalMs)) : nowBeforeWait;
-
-        if (hasAnchor && nowBeforeWait < targetPresentTime) {
-            if (!waitUntilTime(targetPresentTime)) return presented;
+        if (Clock::now() < targetPresentTime) {
+            if (!waitUntilTime(targetPresentTime, allowPrefetch, newestSlot_, lsfgFrameIndex_)) {
+                return presented;
+            }
         }
         if (!running_ || !generating_ || resourceEpoch_ != cycleEpoch || !overlay_ || newestSlot_ < 0) {
             return presented;
         }
 
-        if (!isReal) {
+        if (isGen && genInFlight && !prefetchedValid_) {
+            const bool alreadyDone = vk_->pollOneShotAsyncComplete();
             asyncCompute.wait();
-            if (k == 0) {
-                const double firstGenMs =
-                    std::chrono::duration<double, std::milli>(Clock::now() - computeStart).count();
-                firstPresentEmaMs_ =
-                    (firstPresentEmaMs_ <= 0.0) ? firstGenMs : firstPresentEmaMs_ * 0.9 + firstGenMs * 0.1;
+            genInFlight = false;
+            if (!firstGenMeasured && k == 0) {
+                firstGenMeasured = true;
+                if (!alreadyDone) {
+                    const double synthMs =
+                        std::chrono::duration<double, std::milli>(Clock::now() - firstSubmitTime).count();
+                    const double totalSynthMs = prepassAlreadySubmitted ? (prepassEmaMs_ + synthMs) : synthMs;
+                    genPassEmaMs_ = (genPassEmaMs_ <= 0.0) ? synthMs : (genPassEmaMs_ * 0.85 + synthMs * 0.15);
+                    firstPresentEmaMs_ =
+                        (firstPresentEmaMs_ <= 0.0) ? totalSynthMs : (firstPresentEmaMs_ * 0.85 + totalSynthMs * 0.15);
+                } else if (firstPresentEmaMs_ <= 0.0) {
+                    firstPresentEmaMs_ = 4.0;
+                }
             }
+        } else if (totalPresents == 1 && !prefetchedValid_ && prepassInFlight) {
+            asyncCompute.wait();
+            prepassInFlight = false;
         }
 
-        bool ok;
-        if (isReal) {
+        bool ok = false;
+        if (steps[k].useNewest) {
             ok = overlay_->presentImage(newest.image, VK_IMAGE_LAYOUT_GENERAL, frameWidth_, frameHeight_);
             if (ok) lastPresentedOutputSlot_ = -1;
+        } else if (steps[k].usePrevious) {
+            const int prevSlot = (newestSlot_ == 0) ? 1 : 0;
+            ok = overlay_->presentImage(slots_[prevSlot].image, VK_IMAGE_LAYOUT_GENERAL, frameWidth_, frameHeight_);
+            if (ok) lastPresentedOutputSlot_ = -1;
         } else {
-            const uint32_t outSlot = static_cast<uint32_t>(k) & 1u;
-            const auto& gen = lsfg_->output(outSlot);
+            const auto& gen = lsfg_->output(pendingGenSlot);
             ok = overlay_->presentImage(gen.image, VK_IMAGE_LAYOUT_GENERAL, gen.width, gen.height);
-            if (ok) lastPresentedOutputSlot_ = static_cast<int>(outSlot);
+            if (ok) lastPresentedOutputSlot_ = static_cast<int>(pendingGenSlot);
         }
 
         if (ok) {
             ++presented;
             const auto now = Clock::now();
-            const auto maxDrift = std::chrono::microseconds(
-                std::max<int64_t>(1500, static_cast<int64_t>(stepMs * 1000.0)));
-            if (now > targetPresentTime && (now - targetPresentTime) < maxDrift) {
-                lastPresentTime_ = targetPresentTime;
-            } else {
-                lastPresentTime_ = now;
+            if (lastActualPresent_.time_since_epoch().count() != 0) {
+                const double deltaMs = std::chrono::duration<double, std::milli>(now - lastActualPresent_).count();
+                if (deltaMs < 200.0) {
+                    paceMinMs_ = std::min(paceMinMs_, deltaMs);
+                    paceMaxMs_ = std::max(paceMaxMs_, deltaMs);
+                    paceSumMs_ += deltaMs;
+                    ++paceCount_;
+                }
             }
+            lastActualPresent_ = now;
+
+            const auto baseAnchor = (targetPresentTime < now - toDuration(stepMs * 0.10)) ? now : targetPresentTime;
+            const auto nextTarget = baseAnchor + toDuration(stepMs);
+            const auto minTarget = now + toDuration(stepMs * 0.92);
+            const auto maxTarget = now + toDuration(stepMs * 1.12);
+            nextPresentTime_ = std::clamp(nextTarget, minTarget, maxTarget);
             lastStepMs_ = stepMs;
         } else {
             overlay_->waitForIdle();
             lastPresentedOutputSlot_ = -1;
+            nextPresentTime_ = Clock::now() + toDuration(stepMs);
         }
 
-        // Synthesize the next intermediate frame on the alternate ping-pong slot while `k` displays!
-        if (!isReal && (k + 1) < (totalPresents - 1)) {
-            const double nowCycleMs =
-                std::chrono::duration<double, std::milli>(Clock::now() - computeStart).count();
+        // Prepare the next intermediate frame on the alternate ping-pong slot while `k` displays.
+        if (k + 1 < totalPresents) {
+            const double elapsedFromArrival =
+                std::chrono::duration<double, std::milli>(Clock::now() - arrivalAnchor).count();
             const bool pendingReal = (capture_ && capture_->hasPendingFrame());
-            if ((pendingReal && nowCycleMs >= framePeriodMs * 1.02) || nowCycleMs >= framePeriodMs * 1.25) {
+            const int remainingAfter = (totalPresents - 1) - k;
+            if (pendingReal && elapsedFromArrival >= framePeriodMs * 1.45 + targetLeadMs &&
+                remainingAfter >= 2) {
                 preempted = true;
-                k = totalPresents - 2;  // next loop iteration presents the current Real frame immediately
+                steps.resize(static_cast<size_t>(k + 2));
+                steps[k + 1] = PresentStep{1.0f, true, false};
+                totalPresents = static_cast<int>(steps.size());
                 continue;
             }
 
-            const float tNext = static_cast<float>(k + 2) / static_cast<float>(totalPresents);
-            const uint32_t nextSlot = static_cast<uint32_t>(k + 1) & 1u;
-            if (lastPresentedOutputSlot_ == static_cast<int>(nextSlot)) {
-                overlay_->waitForIdle();
-                lastPresentedOutputSlot_ = -1;
+            if (!steps[k + 1].useNewest && !steps[k + 1].usePrevious) {
+                if (prepassInFlight) {
+                    asyncCompute.wait();
+                    prepassInFlight = false;
+                }
+                const uint32_t nextSlot = (lastPresentedOutputSlot_ == 0) ? 1u : 0u;
+                if (lastPresentedOutputSlot_ == static_cast<int>(nextSlot)) {
+                    overlay_->waitForIdle();
+                    lastPresentedOutputSlot_ = -1;
+                }
+                VkCommandBuffer nextCmd = vk_->beginOneShotCommands(vk_->graphicsCommandPool());
+                lsfg_->recordGeneratePass(nextCmd, fidx, steps[k + 1].t, nextSlot);
+                vk_->submitOneShotAsync(vk_->graphicsPresentQueue(), nextCmd);
+                pendingGenSlot = nextSlot;
+                genInFlight = true;
             }
-            VkCommandBuffer nextCmd = vk_->beginOneShotCommands(vk_->graphicsCommandPool());
-            lsfg_->recordGeneratePass(nextCmd, fidx, tNext, nextSlot);
-            vk_->submitOneShotAsync(vk_->graphicsPresentQueue(), nextCmd);
         }
     }
 
@@ -1648,13 +2261,14 @@ int FrameGenerator::renderCycle(const FrameSlot& newest,
     if (options_.adaptive) {
         if (preempted) {
             const double fit = std::max(2.0, static_cast<double>(presented));
-            const double cur = std::min(adaptiveGpuCapMult_, static_cast<double>(mult));
+            const double cur = std::min(adaptiveGpuCapMult_, static_cast<double>(effectiveMultiplier_));
             adaptiveGpuCapMult_ = std::clamp(cur * 0.6 + fit * 0.4, 2.0, static_cast<double>(kMaxAdaptiveMultiplier));
-        } else if (totalCycleMs <= framePeriodMs * 1.06) {
+        } else if (totalCycleMs <= framePeriodMs * 1.10) {
             adaptiveGpuCapMult_ = std::min(static_cast<double>(kMaxAdaptiveMultiplier), adaptiveGpuCapMult_ + 0.5);
         }
     }
 
+    asyncCompute.keepOnExit = prefetchedValid_;
     return presented;
 }
 

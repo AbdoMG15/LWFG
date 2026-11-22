@@ -9,8 +9,10 @@
 #include "lfg/present/overlay_window.hpp"
 #include "lfg/vulkan_context.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <memory>
 
 namespace lfg {
@@ -45,20 +47,34 @@ private:
     bool startCaptureSession(bool autoSelectActiveWindow = true);
     void stopCaptureSession();
     void handleControlAction(present::ControlAction action);
-    bool waitUntilTime(std::chrono::steady_clock::time_point targetTime);
+    bool waitUntilTime(std::chrono::steady_clock::time_point targetTime,
+                       bool allowPrefetch = false, int currentSlot = -1, uint64_t nextFidx = 0);
+    bool tryPrefetchNextFrame(int currentSlot, uint64_t nextFidx);
+    void clearPrefetchedFrame();
+    void resetPacerState(bool keepTimingEma = false);
 
     bool ensureResources(uint32_t width, uint32_t height, const capture::CaptureTarget& target);
     void configureLsfgResources();
     void destroySlots();
     void ensureStagingBuffer(VkDeviceSize requiredBytes);
     void destroyStagingBuffer();
+    void ensureThumbResources();
+    void destroyThumbResources();
+    void recordThumbDownsample(VkCommandBuffer cmd, VkImage srcImage, uint32_t srcW, uint32_t srcH);
+    bool isCurrentThumbDuplicate() const;
+    void commitCurrentThumb();
+    void recordUniqueFrameTiming(std::chrono::steady_clock::time_point arrivalTime,
+                                 double fallbackPeriodMs, double fallbackJitterMs,
+                                 double& outPeriodMs, double& outJitterMs);
     void copyIntoSlot(const capture::CaptureBuffer& buffer, FrameSlot& slot);
     void uploadViaStagingBuffer(const capture::CaptureBuffer& buffer, FrameSlot& slot);
     // Returns the number of frames that were actually queued to the display this cycle.
     int renderCycle(const FrameSlot& newest,
                     std::chrono::steady_clock::time_point computeStart,
-                    double framePeriodMs, double queueLagMs);
-    int computeEffectiveMultiplier(double framePeriodMs);
+                    std::chrono::steady_clock::time_point arrivalTime,
+                    double framePeriodMs,
+                    double producerJitterMs,
+                    bool prepassAlreadySubmitted = false);
 
     Options options_;
     bool targetFpsAutoInit_ = false;
@@ -87,22 +103,64 @@ private:
     VkDeviceMemory stagingMemory_ = VK_NULL_HANDLE;
     void* stagingMapped_ = nullptr;
     VkDeviceSize stagingSize_ = 0;
+
+    static constexpr uint32_t kThumbW = 64;
+    static constexpr uint32_t kThumbH = 36;
+    static constexpr VkDeviceSize kThumbBytes = static_cast<VkDeviceSize>(kThumbW) * kThumbH * 4u;
+    VkImage thumbImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory thumbImageMemory_ = VK_NULL_HANDLE;
+    VkBuffer thumbBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory thumbBufferMemory_ = VK_NULL_HANDLE;
+    uint8_t* thumbMapped_ = nullptr;
+    std::array<uint8_t, kThumbW * kThumbH * 4u> lastUniqueThumb_{};
+    bool hasLastUniqueThumb_ = false;
+    bool dedupEnabled_ = true;
+
+    std::chrono::steady_clock::time_point lastUniqueArrival_{};
+    bool hasLastUniqueArrival_ = false;
+    std::array<double, 16> uniqueDeltas_{};
+    size_t uniqueDeltaCount_ = 0;
+    size_t uniqueDeltaHead_ = 0;
+    int uniqueRegimeShiftCount_ = 0;
+    bool hasSmoothedUniquePeriod_ = false;
+    double smoothedUniquePeriodMs_ = 16.6667;
+    double smoothedUniqueJitterMs_ = 0.0;
+    uint32_t dupsDroppedInWindow_ = 0;
+
     bool forceLinearCapture_ = false;
     bool forceShmCapture_ = false;
     bool directImportFailed_ = false;
     bool loggedStagingFallback_ = false;
 
-    // Display-aware & Adaptive pacing state (PLL frame pacer).
+    // Display-aware & Adaptive pacing state (continuous PLL frame pacer).
     static constexpr int kMaxAdaptiveMultiplier = 42;
     int effectiveMultiplier_ = 0;     // multiplier actually used this cycle
-    double adaptiveAccum_ = 0.0;      // fractional cadence accumulator for Adaptive FG
+    double adaptivePhaseMs_ = 0.0;    // continuous Adaptive cadence phase across real frames
     double adaptiveGpuCapMult_ = static_cast<double>(kMaxAdaptiveMultiplier);
     double firstPresentEmaMs_ = 0.0;  // smoothed GPU compute time per cycle
-    std::chrono::steady_clock::time_point lastPresentTime_{};
+    double prepassEmaMs_ = 0.0;
+    double genPassEmaMs_ = 0.0;
+    std::chrono::steady_clock::time_point nextPresentTime_{};
+    std::chrono::steady_clock::time_point lastActualPresent_{};
     double lastStepMs_ = 0.0;
     int lastPresentedOutputSlot_ = -1;
     uint64_t resourceEpoch_ = 0;
     std::chrono::steady_clock::time_point lastUiPollTime_{};
+
+    // Overlapped next-frame prefetch & prepass state.
+    bool prefetchedValid_ = false;
+    int prefetchedSlot_ = -1;
+    uint64_t prefetchedFidx_ = 0;
+    double prefetchedPeriodMs_ = 16.6667;
+    double prefetchedJitterMs_ = 0.0;
+    std::chrono::steady_clock::time_point prefetchedArrival_{};
+    std::chrono::steady_clock::time_point prefetchedStart_{};
+
+    // 1-second output pacing telemetry (ms between consecutive presents).
+    double paceMinMs_ = 1e9;
+    double paceMaxMs_ = 0.0;
+    double paceSumMs_ = 0.0;
+    uint32_t paceCount_ = 0;
 
     std::atomic<bool> running_{true};
     std::atomic<int> pendingSignalAction_{0};

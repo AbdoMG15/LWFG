@@ -181,7 +181,7 @@ VulkanContext::~VulkanContext() {
 void VulkanContext::createInstance(const std::vector<const char*>& surfaceExtensions, bool enableValidation) {
     VkApplicationInfo appInfo{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     appInfo.pApplicationName = "lfg-linux";
-    appInfo.applicationVersion = VK_MAKE_VERSION(0, 1, 5);
+    appInfo.applicationVersion = VK_MAKE_VERSION(0, 1, 6);
     appInfo.pEngineName = "lfg-linux";
     appInfo.apiVersion = VK_API_VERSION_1_3;
 
@@ -614,6 +614,16 @@ void VulkanContext::waitOneShotAsync() const {
     if (!oneShotInUse_ || oneShotFence_ == VK_NULL_HANDLE) return;
     VK_CHECK(vkWaitForFences(device_, 1, &oneShotFence_, VK_TRUE, UINT64_MAX));
     oneShotInUse_ = false;
+}
+
+bool VulkanContext::pollOneShotAsyncComplete() const {
+    if (!oneShotInUse_ || oneShotFence_ == VK_NULL_HANDLE) return true;
+    VkResult res = vkGetFenceStatus(device_, oneShotFence_);
+    if (res == VK_SUCCESS) {
+        oneShotInUse_ = false;
+        return true;
+    }
+    return false;
 }
 
 }  // namespace lfg

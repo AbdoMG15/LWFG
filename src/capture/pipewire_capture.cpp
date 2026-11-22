@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -127,6 +128,10 @@ void PipeWireCapture::start(const CaptureTarget& target, bool linearModifierOnly
     hasLastProducerFrame_ = false;
     hasSmoothedPeriod_ = false;
     smoothedProducerPeriodMs_ = 16.67;
+    smoothedProducerJitterMs_ = 0.0;
+    deltaCount_ = 0;
+    deltaHead_ = 0;
+    regimeShiftCount_ = 0;
     pendingReady_.store(false, std::memory_order_release);
     fixationAttempts_ = 0;
     width_ = static_cast<uint32_t>(target.width > 0 ? target.width : 1920);
@@ -214,6 +219,16 @@ WaitStatus PipeWireCapture::waitForBuffer(int timeoutMs, CaptureBuffer& out) {
     if (pending_.generation != generation_.load()) return WaitStatus::Timeout;
     out = pending_;
     return WaitStatus::Frame;
+}
+
+bool PipeWireCapture::tryTakeBuffer(CaptureBuffer& out) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (failed_ || !pendingValid_) return false;
+    pendingValid_ = false;
+    pendingReady_.store(false, std::memory_order_release);
+    if (pending_.generation != generation_.load()) return false;
+    out = pending_;
+    return true;
 }
 
 void PipeWireCapture::releaseBuffer(const CaptureBuffer& buffer) {
@@ -447,13 +462,54 @@ void PipeWireCapture::handleProcess() {
     auto now = std::chrono::steady_clock::now();
     if (hasLastProducerFrame_) {
         double deltaMs = std::chrono::duration<double, std::milli>(now - lastProducerFrame_).count();
-        // Measure the true producer interval on the PipeWire thread (isolated from main-thread sleeps)
-        if (deltaMs >= 3.5 && deltaMs <= 120.0) {
-            if (!hasSmoothedPeriod_) {
-                smoothedProducerPeriodMs_ = deltaMs;
+        // Measure the true producer interval on the PipeWire thread using an outlier-resistant
+        // trimmed mean so single compositor hiccups / 3:2 pulldown never destabilize frame pacing.
+        if (deltaMs >= 2.5 && deltaMs <= 160.0) {
+            if (hasSmoothedPeriod_ &&
+                std::abs(deltaMs - smoothedProducerPeriodMs_) > smoothedProducerPeriodMs_ * 0.25) {
+                if (++regimeShiftCount_ >= 4) {
+                    deltaCount_ = 0;
+                    deltaHead_ = 0;
+                    regimeShiftCount_ = 0;
+                }
+            } else {
+                regimeShiftCount_ = 0;
+            }
+
+            recentDeltas_[deltaHead_] = deltaMs;
+            deltaHead_ = (deltaHead_ + 1) % recentDeltas_.size();
+            if (deltaCount_ < recentDeltas_.size()) ++deltaCount_;
+
+            std::array<double, 16> sorted{};
+            const size_t n = std::min(deltaCount_, sorted.size());
+            for (size_t i = 0; i < n; ++i) sorted[i] = recentDeltas_[i];
+            for (size_t i = 1; i < n; ++i) {
+                const double key = sorted[i];
+                size_t j = i;
+                while (j > 0 && sorted[j - 1] > key) {
+                    sorted[j] = sorted[j - 1];
+                    --j;
+                }
+                sorted[j] = key;
+            }
+
+            const size_t trim = n / 5;
+            const size_t lo = trim;
+            const size_t hi = (n > trim * 2) ? (n - trim) : n;
+            double sum = 0.0;
+            for (size_t i = lo; i < hi; ++i) sum += sorted[i];
+            const double trimmedMean = sum / static_cast<double>(std::max<size_t>(1, hi - lo));
+
+            const size_t p90Idx = (n > 1) ? ((n - 1) * 9 / 10) : 0;
+            const double upperSpread = std::max(0.0, sorted[p90Idx] - trimmedMean);
+
+            if (!hasSmoothedPeriod_ || n <= 4) {
+                smoothedProducerPeriodMs_ = trimmedMean;
+                smoothedProducerJitterMs_ = upperSpread;
                 hasSmoothedPeriod_ = true;
             } else {
-                smoothedProducerPeriodMs_ = smoothedProducerPeriodMs_ * 0.82 + deltaMs * 0.18;
+                smoothedProducerPeriodMs_ = smoothedProducerPeriodMs_ * 0.65 + trimmedMean * 0.35;
+                smoothedProducerJitterMs_ = smoothedProducerJitterMs_ * 0.75 + upperSpread * 0.25;
             }
         }
     }
@@ -468,6 +524,7 @@ void PipeWireCapture::handleProcess() {
     cb.generation = generation_.load();
     cb.arrivalTime = now;
     cb.producerPeriodMs = smoothedProducerPeriodMs_;
+    cb.producerJitterMs = smoothedProducerJitterMs_;
 
     {
         std::lock_guard<std::mutex> lock(mutex_);

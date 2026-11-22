@@ -200,7 +200,7 @@ int main(int argc, char** argv) {
     }
 
     writePidFile();
-    std::fprintf(stderr, "[lwfg] LWFG (Linux Windowed Frame Generation) — version 0.1.5 (Lossless Scaling LSFG 3.1 Steam Engine)\n");
+    std::fprintf(stderr, "[lwfg] LWFG (Linux Windowed Frame Generation) — version 0.1.6 (Lossless Scaling LSFG 3.1 Steam Engine)\n");
     if (hadSavedSettings) {
         std::fprintf(stderr, "[lfg] loaded saved settings from %s\n", lfg::settingsFilePath().string().c_str());
     }

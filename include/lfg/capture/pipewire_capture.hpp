@@ -6,6 +6,7 @@
 #include <pipewire/pipewire.h>
 #include <spa/param/video/format-utils.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -29,6 +30,7 @@ struct CaptureBuffer {
     uint32_t generation = 0;
     std::chrono::steady_clock::time_point arrivalTime{};
     double producerPeriodMs = 16.67;
+    double producerJitterMs = 0.0;
 };
 
 enum class WaitStatus { Frame, Timeout, Failed };
@@ -45,6 +47,7 @@ public:
     void stop();
 
     WaitStatus waitForBuffer(int timeoutMs, CaptureBuffer& out);
+    bool tryTakeBuffer(CaptureBuffer& out);
     bool hasPendingFrame() const { return pendingReady_.load(std::memory_order_acquire); }
     void releaseBuffer(const CaptureBuffer& buffer);
 
@@ -85,6 +88,11 @@ private:
     bool hasLastProducerFrame_ = false;
     bool hasSmoothedPeriod_ = false;
     double smoothedProducerPeriodMs_ = 16.67;
+    double smoothedProducerJitterMs_ = 0.0;
+    std::array<double, 16> recentDeltas_{};
+    size_t deltaCount_ = 0;
+    size_t deltaHead_ = 0;
+    int regimeShiftCount_ = 0;
 
     std::atomic<uint32_t> generation_{0};
 

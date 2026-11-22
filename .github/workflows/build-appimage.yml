@@ -60,7 +60,7 @@ jobs:
           if [ "${GITHUB_EVENT_NAME}" = "release" ] && [ -n "${GITHUB_REF_NAME}" ]; then
             RAW_VERSION="${GITHUB_REF_NAME#v}"
           else
-            RAW_VERSION="0.1.5"
+            RAW_VERSION="0.1.6"
           fi
           RPM_VERSION="$(printf '%s' "$RAW_VERSION" | tr '-' '~')"
 

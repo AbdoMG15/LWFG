@@ -1939,13 +1939,13 @@ void ControlPanel::draw() {
         drawText(tx, ty, fittedLabel, textColor, btnScale);
     }
 
-    // Clean Footer Bar with version 0.1.5 and dynamic hover tooltips
+    // Clean Footer Bar with version 0.1.6 and dynamic hover tooltips
     int footerY = H - footerH;
     fillRect(0, static_cast<int16_t>(footerY), static_cast<uint16_t>(W), static_cast<uint16_t>(footerH), 0x0C1619);
     fillRect(0, static_cast<int16_t>(footerY), static_cast<uint16_t>(W), 1, 0x1F363D);
     int footerTextY = footerY + (footerH - 7) / 2;
 
-    const std::string versionStr = "version 0.1.5";
+    const std::string versionStr = "version 0.1.6";
     int versionW = static_cast<int>(versionStr.size()) * 6;
 
     if (hoverIndex_ >= 0 && hoverIndex_ < static_cast<int>(buttons_.size()) &&
@@ -1955,7 +1955,7 @@ void ControlPanel::draw() {
         drawText(static_cast<int16_t>(padX), static_cast<int16_t>(footerTextY), fittedTip, 0x5EEAD4, 1);
     }
 
-    // Right-aligned version 0.1.5
+    // Right-aligned version 0.1.6
     int versionX = W - padX - versionW;
     drawText(static_cast<int16_t>(versionX), static_cast<int16_t>(footerTextY), versionStr, 0xFFA133, 1);
 
