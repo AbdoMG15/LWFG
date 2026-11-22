@@ -48,8 +48,12 @@ private:
     void stopCaptureSession();
     void handleControlAction(present::ControlAction action);
     bool waitUntilTime(std::chrono::steady_clock::time_point targetTime,
-                       bool allowPrefetch = false, int currentSlot = -1, uint64_t nextFidx = 0);
-    bool tryPrefetchNextFrame(int currentSlot, uint64_t nextFidx);
+                       bool allowCaptureDrain = false, bool allowPrefetch = false,
+                       int currentSlot = -1, uint64_t nextFidx = 0);
+    bool pollAndClassifyPendingCapture();
+    bool promotePendingToPrefetch(int currentSlot, uint64_t nextFidx);
+    void copyPendingIntoSlot(FrameSlot& dstSlot);
+    void clearPendingUniqueFrame();
     void clearPrefetchedFrame();
     void resetPacerState(bool keepTimingEma = false);
 
@@ -96,6 +100,7 @@ private:
     uint64_t lsfgFrameIndex_ = 0;
 
     FrameSlot slots_[2];
+    FrameSlot pendingSlot_{};
     uint32_t frameWidth_ = 0;
     uint32_t frameHeight_ = 0;
 
@@ -147,7 +152,14 @@ private:
     uint64_t resourceEpoch_ = 0;
     std::chrono::steady_clock::time_point lastUiPollTime_{};
 
-    // Overlapped next-frame prefetch & prepass state.
+    // Overlapped next-frame drain, prefetch & prepass state.
+    bool pendingUniqueValid_ = false;
+    uint32_t pendingUniqueCount_ = 0;
+    double pendingUniquePeriodMs_ = 16.6667;
+    double pendingUniqueJitterMs_ = 0.0;
+    std::chrono::steady_clock::time_point pendingUniqueArrival_{};
+    std::chrono::steady_clock::time_point pendingUniqueStart_{};
+
     bool prefetchedValid_ = false;
     int prefetchedSlot_ = -1;
     uint64_t prefetchedFidx_ = 0;
