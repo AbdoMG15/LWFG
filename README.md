@@ -77,3 +77,4 @@ sudo cmake --install build
 - **[Lossless Scaling](https://store.steampowered.com/app/993090/Lossless_Scaling/)** — Official LSFG 3.1 compute shaders loaded at runtime from the user's legally purchased Steam installation.
 
 ---
+To report bugs or suggestions please email: abdomg.contact@gmail.com
