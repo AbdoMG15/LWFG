@@ -3,7 +3,6 @@
 **LWFG** is an **unofficial**, independent Linux windowed frame generation overlay powered by **Lossless Scaling Frame Generation (LSFG 3.1)** over PipeWire, `xdg-desktop-portal`, and Vulkan.
 
 > [!WARNING]
-> **Unofficial Project & Steam Requirement**
 > - This is an **unofficial** third-party project and is **not** affiliated with, endorsed by, or supported by the creator of Lossless Scaling.
 > - You **must purchase and install [Lossless Scaling on Steam](https://store.steampowered.com/app/993090/Lossless_Scaling/)** first. **LWFG** does **not** include or redistribute any proprietary shader files.
 > - If LWFG does not automatically detect `Lossless.dll` from your Steam library on startup, open the **Settings** tab inside the app and **locate `Lossless.dll` (or its folder) manually** — frame generation will not work until `Lossless.dll` is loaded.
