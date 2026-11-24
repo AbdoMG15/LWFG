@@ -66,11 +66,6 @@ sudo cmake --install build
 3. **Displays over your app:** Presents the real and generated frames on the screen.
 
 
-If you enjoyed LWFG and want to buy me a shawarma(:
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/abdomg)
----
-
-
 ## Credits
 
 - **[Lossless Scaling](https://store.steampowered.com/app/993090/Lossless_Scaling/)** — Official LSFG 3.1 compute shaders loaded at runtime from the user's legally purchased Steam installation.
