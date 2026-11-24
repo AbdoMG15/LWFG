@@ -7,11 +7,6 @@
 > - You **must purchase and install [Lossless Scaling on Steam](https://store.steampowered.com/app/993090/Lossless_Scaling/)** first. **LWFG** does **not** include or redistribute any proprietary shader files.
 > - If LWFG does not automatically detect `Lossless.dll` from your Steam library on startup, open the **Settings** tab inside the app and **locate `Lossless.dll` (or its folder) manually** — frame generation will not work until `Lossless.dll` is loaded.
 
-
-If you enjoyed LWFG and want to buy me a shawarma(:
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/abdomg)
----
-
 ## Installation
 
 ### Option 1: One-Line Terminal Installer (Any `x86_64` Linux Distro)
@@ -70,6 +65,10 @@ sudo cmake --install build
 2. **Generates intermediate frames:** Runs Lossless Scaling's optical-flow shaders across the previous and current real frames to estimate motion and synthesize new frames in between.
 3. **Displays over your app:** Presents the real and generated frames on the screen.
 
+
+If you enjoyed LWFG and want to buy me a shawarma(:
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/abdomg)
+---
 
 
 ## Credits
