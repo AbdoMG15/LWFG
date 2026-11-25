@@ -1163,7 +1163,7 @@ void FrameGenerator::configureLsfgResources() {
     ++resourceEpoch_;
     try {
         lsfg_->configure(frameWidth_, frameHeight_, options_.flowScale, options_.performanceMode,
-                         slots_[0].view, slots_[1].view);
+                         slots_[0].image, slots_[0].view, slots_[1].image, slots_[1].view);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[lsfg] warning: pipeline allocation failed (%s) — retrying in Performance Mode (50%% flow)...\n",
                      e.what());
@@ -1174,7 +1174,7 @@ void FrameGenerator::configureLsfgResources() {
             controlPanel_->setFlowScale(options_.flowScale);
         }
         lsfg_->configure(frameWidth_, frameHeight_, options_.flowScale, options_.performanceMode,
-                         slots_[0].view, slots_[1].view);
+                         slots_[0].image, slots_[0].view, slots_[1].image, slots_[1].view);
     }
     newestSlot_ = -1;
     lsfgFrameIndex_ = 0;

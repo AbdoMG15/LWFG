@@ -18,6 +18,52 @@ pkg_check_modules(GLIB      REQUIRED IMPORTED_TARGET glib-2.0 gio-2.0 gio-unix-2
 pkg_check_modules(XCB       REQUIRED IMPORTED_TARGET xcb xcb-shape xcb-randr)
 pkg_check_modules(DRM       REQUIRED IMPORTED_TARGET libdrm)
 
+add_library(lsfg_vk_backend STATIC
+    thirdparty/lsfg-vk/common/src/helpers/errors.cpp
+    thirdparty/lsfg-vk/common/src/vulkan/buffer.cpp
+    thirdparty/lsfg-vk/common/src/vulkan/command_buffer.cpp
+    thirdparty/lsfg-vk/common/src/vulkan/descriptor_pool.cpp
+    thirdparty/lsfg-vk/common/src/vulkan/descriptor_set.cpp
+    thirdparty/lsfg-vk/common/src/vulkan/fence.cpp
+    thirdparty/lsfg-vk/common/src/vulkan/image.cpp
+    thirdparty/lsfg-vk/common/src/vulkan/sampler.cpp
+    thirdparty/lsfg-vk/common/src/vulkan/semaphore.cpp
+    thirdparty/lsfg-vk/common/src/vulkan/shader.cpp
+    thirdparty/lsfg-vk/common/src/vulkan/timeline_semaphore.cpp
+    thirdparty/lsfg-vk/common/src/vulkan/vulkan.cpp
+    thirdparty/lsfg-vk/backend/src/extraction/dll_reader.cpp
+    thirdparty/lsfg-vk/backend/src/extraction/shader_registry.cpp
+    thirdparty/lsfg-vk/backend/src/helpers/limits.cpp
+    thirdparty/lsfg-vk/backend/src/helpers/managed_shader.cpp
+    thirdparty/lsfg-vk/backend/src/helpers/utils.cpp
+    thirdparty/lsfg-vk/backend/src/shaderchains/alpha0.cpp
+    thirdparty/lsfg-vk/backend/src/shaderchains/alpha1.cpp
+    thirdparty/lsfg-vk/backend/src/shaderchains/beta0.cpp
+    thirdparty/lsfg-vk/backend/src/shaderchains/beta1.cpp
+    thirdparty/lsfg-vk/backend/src/shaderchains/delta0.cpp
+    thirdparty/lsfg-vk/backend/src/shaderchains/delta1.cpp
+    thirdparty/lsfg-vk/backend/src/shaderchains/gamma0.cpp
+    thirdparty/lsfg-vk/backend/src/shaderchains/gamma1.cpp
+    thirdparty/lsfg-vk/backend/src/shaderchains/generate.cpp
+    thirdparty/lsfg-vk/backend/src/shaderchains/mipmaps.cpp
+)
+
+target_include_directories(lsfg_vk_backend PUBLIC
+    thirdparty/lsfg-vk/common/include
+    thirdparty/lsfg-vk/backend/src
+)
+
+target_link_libraries(lsfg_vk_backend PUBLIC
+    Vulkan::Vulkan
+    ${CMAKE_DL_LIBS}
+)
+
+target_compile_options(lsfg_vk_backend PRIVATE
+    -Wno-unused-parameter
+    -Wno-missing-field-initializers
+    -Wno-unknown-pragmas
+)
+
 set(LFG_SOURCES
     src/main.cpp
     src/vulkan_context.cpp
@@ -36,6 +82,7 @@ target_include_directories(lfg PRIVATE include)
 
 target_link_libraries(lfg PRIVATE
     Vulkan::Vulkan
+    lsfg_vk_backend
     PkgConfig::PIPEWIRE
     PkgConfig::LIBPORTAL
     PkgConfig::GLIB
