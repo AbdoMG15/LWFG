@@ -62,13 +62,14 @@ sudo cmake --install build
 
 ## How It Works
 1. **Captures your window or screen:** Uses `xdg-desktop-portal` and PipeWire to grab each new frame on the GPU.
-2. **Generates intermediate frames:** Runs Lossless Scaling's optical-flow shaders across the previous and current real frames to estimate motion and synthesize new frames in between.
+2. **Generates intermediate frames:** LWFG uses [lsfg-vk](https://lsfg-vk.dev/) by **PancakeTAS** to apply Lossless Scaling's frame generation.
 3. **Displays over your app:** Presents the real and generated frames on the screen.
 
 
 ## Credits
 
 - **[Lossless Scaling](https://store.steampowered.com/app/993090/Lossless_Scaling/)** — Official LSFG 3.1 compute shaders loaded at runtime from the user's legally purchased Steam installation.
+- - **[lsfg-vk](https://lsfg-vk.dev/)** by **PancakeTAS** — for the GPL-3.0 `lsfg-vk-backend` LSFG 3.1 Vulkan compute execution backend.
 
 ---
 To report bugs or suggestions please email: abdomg.contact@gmail.com
