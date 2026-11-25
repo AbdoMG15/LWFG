@@ -72,4 +72,4 @@ sudo cmake --install build
 - **[lsfg-vk](https://lsfg-vk.dev/)** by **PancakeTAS** — for the GPL-3.0 `lsfg-vk-backend` LSFG 3.1 Vulkan compute execution backend.
 
 ---
-To report bugs or suggestions please email: abdomg.contact@gmail.com
+**Note** that this project is vibecoded and to report bugs or suggestions please email: abdomg.contact@gmail.com
