@@ -69,7 +69,7 @@ sudo cmake --install build
 ## Credits
 
 - **[Lossless Scaling](https://store.steampowered.com/app/993090/Lossless_Scaling/)** — Official LSFG 3.1 compute shaders loaded at runtime from the user's legally purchased Steam installation.
-- - **[lsfg-vk](https://lsfg-vk.dev/)** by **PancakeTAS** — for the GPL-3.0 `lsfg-vk-backend` LSFG 3.1 Vulkan compute execution backend.
+- **[lsfg-vk](https://lsfg-vk.dev/)** by **PancakeTAS** — for the GPL-3.0 `lsfg-vk-backend` LSFG 3.1 Vulkan compute execution backend.
 
 ---
 To report bugs or suggestions please email: abdomg.contact@gmail.com
