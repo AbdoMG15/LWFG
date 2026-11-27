@@ -1,7 +1,6 @@
 # <img src="assets/lfg-linux.png" width="38" align="top" /> LWFG (Linux Windowed Frame Generation)
 
-**LWFG** is an **unofficial**, independent Linux windowed frame generation overlay powered by **Lossless Scaling Frame Generation (LSFG 3.1)** over PipeWire, `xdg-desktop-portal`, and Vulkan.
-
+**LWFG** is an **unofficial**, independent Linux windowed frame generation overlay powered by **Lossless Scaling Frame Generation (LSFG 3.1)** and **lsfg-vk** by **PancakeTAS**.
 > [!WARNING]
 > - This is an **unofficial** third-party project and is **not** affiliated with, endorsed by, or supported by the creator of Lossless Scaling.
 > - You **must purchase and install [Lossless Scaling on Steam](https://store.steampowered.com/app/993090/Lossless_Scaling/)** first. **LWFG** does **not** include or redistribute any proprietary files.
@@ -71,5 +70,7 @@ sudo cmake --install build
 - **[Lossless Scaling](https://store.steampowered.com/app/993090/Lossless_Scaling/)** — Official LSFG 3.1 compute shaders loaded at runtime from the user's legally purchased Steam installation.
 - **[lsfg-vk](https://lsfg-vk.dev/)** by **PancakeTAS** — for the GPL-3.0 `lsfg-vk-backend` LSFG 3.1 Vulkan compute execution backend.
 
----
-**Note** that this project is vibecoded and to report bugs or suggestions please email: abdomg.contact@gmail.com
+## Important Notes
+- This project is **vibecoded**.
+- I only got to test it on two laptops having CachyOS installed on them.
+- For reporting bugs or suggestions contact: abdomg.contact@gmail.com
